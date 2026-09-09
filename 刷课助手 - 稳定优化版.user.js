@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.15.1
+// @version      1.15.2
 // @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://testingcf.jsdelivr.net/gh/Arturia169/cq-21tb-shuake@main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -1112,6 +1112,36 @@
     };
   })();
 
+  
+  /* ---------- 课程卡片 CourseId 提取通用工具 ---------- */
+  function getCardCourseId(card) {
+    if (!card) return '';
+    try {
+      if (card.__vue__ && card.__vue__.courseInfo && card.__vue__.courseInfo.courseId) {
+        return String(card.__vue__.courseInfo.courseId);
+      }
+    } catch (e) {}
+    const nodes = [card].concat(Array.prototype.slice.call(card.querySelectorAll(
+      '[data-course-id], [data-courseid], [course-id], [courseid], [data-id], a[href]'
+    )));
+    const attrs = ['data-course-id', 'data-courseid', 'course-id', 'courseid', 'data-id'];
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = 0; j < attrs.length; j++) {
+        const val = nodes[i] && nodes[i].getAttribute && nodes[i].getAttribute(attrs[j]);
+        if (val && /^[\w-]{4,}$/.test(val)) return String(val);
+      }
+      const href = nodes[i] && nodes[i].getAttribute && nodes[i].getAttribute('href');
+      if (href) {
+        try {
+          const u = new URL(href, location.href);
+          const val = u.searchParams.get('courseId') || u.searchParams.get('courseid') || u.searchParams.get('id');
+          if (val) return String(val);
+        } catch (e) {}
+      }
+    }
+    return '';
+  }
+
   /* ---------- 🚀 纯后台无头虚拟刷课执行器 (VirtualCourseWorker) ---------- */
   function VirtualCourseWorker(courseInfo, callbacks) {
     const courseId = String(courseInfo.courseId || courseInfo.id || '');
@@ -1613,6 +1643,51 @@
   }
 
   /* ---------- 🚀 纯后台静默舰队看板组件 (顶级通用组件) ---------- */
+  
+  /* ---------- 🚀 静默舰队即时全景抓取与任务派发 ---------- */
+  function scanAndDispatchFleet() {
+    const isDetail = location.hash.indexOf('courseDetail') > -1 || location.href.indexOf('courseDetail') > -1;
+    const isList = location.hash.indexOf('course/list') > -1 || location.href.indexOf('course/list') > -1;
+
+    if (isDetail) {
+      const cards = document.querySelectorAll('.text-item.cursor, .course-item, .box-card');
+      const fleetCourses = [];
+      cards.forEach(function (c) {
+        const text = c.textContent || '';
+        if (text.indexOf('已完成') > -1) return;
+        try {
+          if (c.__vue__ && c.__vue__.courseInfo) {
+            const ci = c.__vue__.courseInfo;
+            if (ci.status === 2 || ci.schedule >= 100) return;
+          }
+        } catch (e) {}
+        const cid = getCardCourseId(c);
+        if (!cid) return;
+        const titleEl = c.querySelector('.text-title, .title, .course-name, h4, h3');
+        const title = titleEl ? titleEl.textContent.trim() : ('课程_' + cid);
+        fleetCourses.push({
+          courseId: cid,
+          title: title,
+          sourceId: '',
+          providerCorpCode: ''
+        });
+      });
+
+      if (fleetCourses.length > 0) {
+        HeadlessFleetManager.setCourses(fleetCourses);
+        console.log('[刷课助手-静默舰队] 🎯 立即就地捕获待学课程 ' + fleetCourses.length + ' 门加入静默并发队列！');
+      } else {
+        console.log('[刷课助手-静默舰队] ℹ️ 当前页面卡片暂未完全载入或已全部学完，静默后台保持待命');
+      }
+    } else if (isList) {
+      console.log('[刷课助手-静默舰队] 🎯 列表页触发静默舰队，自动进入目标年度攻坚...');
+      const enterBtns = document.querySelectorAll('.course__item .enter-btn, .box-card .enter-btn');
+      if (enterBtns.length > 0) {
+        enterBtns[0].click();
+      }
+    }
+  }
+
   function renderFleetDashboard() {
     const panel = cachedEl('tb21-auto-panel');
     if (!panel) return;
@@ -1672,10 +1747,17 @@
           '<input type="checkbox" id="tb21-headless-toggle"' + (isFleetActive ? ' checked' : '') + '>' +
           '<span>🚀 纯后台静默舰队</span>' +
         '</label>' +
+        '<span class="ap-fleet-status-tag" style="font-size:10px;padding:1px 6px;border-radius:4px;' +
+          (isFleetActive ? 'background:rgba(16,185,129,.15);color:#10b981;border:1px solid rgba(16,185,129,.3);' : 'background:rgba(148,163,184,.1);color:#94a3b8;') + '">' +
+          (isFleetActive ? ('🟢 运行中 (' + workers.length + '/' + conc + '线)') : '⚪ 已就绪') +
+        '</span>' +
+      '</div>' +
+      '<div class="ap-fleet-conc-row">' +
+        '<span class="ap-fleet-conc-title" title="后台同时挂机的课程数量">并发路数:</span>' +
         '<div class="ap-fleet-conc-btns">' +
-          '<button class="ap-conc-btn' + (conc === 2 ? ' active' : '') + '" data-conc="2" title="并发2门">2</button>' +
-          '<button class="ap-conc-btn' + (conc === 3 ? ' active' : '') + '" data-conc="3" title="并发3门(推荐)">3</button>' +
-          '<button class="ap-conc-btn' + (conc === 5 ? ' active' : '') + '" data-conc="5" title="并发5门">5</button>' +
+          '<button class="ap-conc-btn' + (conc === 2 ? ' active' : '') + '" data-conc="2" title="同时静默挂机2门课：平稳低调">2门</button>' +
+          '<button class="ap-conc-btn' + (conc === 3 ? ' active' : '') + '" data-conc="3" title="同时静默挂机3门课(系统推荐)：效率提升3倍且最稳定">3门(推荐) ★</button>' +
+          '<button class="ap-conc-btn' + (conc === 5 ? ' active' : '') + '" data-conc="5" title="同时静默挂机5门课：极速冲刺，效率提升5倍">5门</button>' +
         '</div>' +
       '</div>' +
       '<div class="ap-fleet-list">' + cardsHtml + '</div>' +
@@ -1686,6 +1768,7 @@
       toggle.addEventListener('change', function () {
         if (toggle.checked) {
           HeadlessFleetManager.start();
+          scanAndDispatchFleet();
         } else {
           HeadlessFleetManager.stop();
         }
@@ -1697,6 +1780,10 @@
       btn.addEventListener('click', function () {
         const c = parseInt(btn.dataset.conc, 10);
         HeadlessFleetManager.setConcurrency(c);
+        if (!HeadlessFleetManager.isFleetRunning()) {
+          HeadlessFleetManager.start();
+        }
+        scanAndDispatchFleet();
         renderFleetDashboard();
       });
     });
@@ -1755,10 +1842,12 @@
       #tb21-auto-panel .ap-fleet-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
       #tb21-auto-panel .ap-fleet-label{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;color:#38bdf8;cursor:pointer}
       #tb21-auto-panel .ap-fleet-label input{accent-color:#0284c7;cursor:pointer}
-      #tb21-auto-panel .ap-fleet-conc-btns{display:flex;align-items:center;gap:3px}
-      #tb21-auto-panel .ap-conc-btn{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#94a3b8;font-size:10px;padding:1px 6px;border-radius:4px;cursor:pointer;transition:all .2s}
-      #tb21-auto-panel .ap-conc-btn:hover{color:#fff;background:rgba(255,255,255,.12)}
-      #tb21-auto-panel .ap-conc-btn.active{background:#0284c7;color:#fff;border-color:#38bdf8;font-weight:700}
+      #tb21-auto-panel .ap-fleet-conc-row{display:flex;align-items:center;justify-content:space-between;margin:4px 0 6px;padding:4px 6px;background:rgba(255,255,255,.03);border-radius:6px;border:1px solid rgba(255,255,255,.05)}
+      #tb21-auto-panel .ap-fleet-conc-title{font-size:10px;color:#94a3b8;font-weight:600}
+      #tb21-auto-panel .ap-fleet-conc-btns{display:flex;align-items:center;gap:4px}
+      #tb21-auto-panel .ap-conc-btn{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#94a3b8;font-size:10px;padding:2px 6px;border-radius:4px;cursor:pointer;transition:all .2s;white-space:nowrap}
+      #tb21-auto-panel .ap-conc-btn:hover{color:#fff;background:rgba(255,255,255,.14)}
+      #tb21-auto-panel .ap-conc-btn.active{background:linear-gradient(135deg,#0284c7,#0369a1);color:#fff;border-color:#38bdf8;font-weight:700;box-shadow:0 0 8px rgba(56,189,248,.35)}
       #tb21-auto-panel .ap-fleet-list{display:flex;flex-direction:column;gap:5px;max-height:160px;overflow-y:auto;padding-right:2px}
       #tb21-auto-panel .ap-fleet-card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);border-radius:6px;padding:5px 7px}
       #tb21-auto-panel .ap-fleet-card-title{display:flex;justify-content:space-between;align-items:center;font-size:11px;font-weight:600;color:#f1f5f9}
@@ -3340,10 +3429,11 @@
     function isEleTabName(str) { return !!(str && str.indexOf('选修') > -1); }
 
     routeInterval(function () {
-      if (!isAutoRunning()) { stage = 0; exhaustedTabs = {}; return; }
+      const isFleet = HeadlessFleetManager.isFleetRunning();
+      if (!isAutoRunning() && !isFleet) { stage = 0; exhaustedTabs = {}; return; }
 
       // 🚀 纯后台静默舰队优先调度：若静默挂机开启，自动搜集计划内未完成课程加入舰队，全权由后台接管！
-      if (HeadlessFleetManager.isFleetRunning()) {
+      if (isFleet) {
         const allCards = getVisibleCards();
         const credit = readCategoryRequirement();
         const plan = computeOptimalCoursePlan(allCards, credit);
