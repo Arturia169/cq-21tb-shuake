@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.12.6
+// @version      1.12.7
 // @description  在线课程学习辅助（21tb / 重庆公需课）：倍速播放（2x~16x）、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -43,6 +43,90 @@
               };
             } catch(e) {}
 
+            // 0.01 核心绝杀：彻底拦截平台对视频 seeking / seeked 事件的监听！
+            // 平台的“学霸君，系统检测到你的学习行为存在异常”100% 依赖于监听 video 的 seeking / seeked 发现快进！
+            // 屏蔽之后，平台播放器对步进快进完全变成聋子和瞎子，根本不知道发生了快进！
+            try {
+              const rawMediaAddEventListener = HTMLMediaElement.prototype.addEventListener;
+              HTMLMediaElement.prototype.addEventListener = function(type, listener, options) {
+                if (type === 'seeking' || type === 'seeked') {
+                  // 拦截平台反作弊监听，但允许自身内部使用
+                  if (listener && listener.__tb21Internal) {
+                    return rawMediaAddEventListener.call(this, type, listener, options);
+                  }
+                  console.log('[刷课助手-护盾] 🛡️ 成功拦截平台对 video.' + type + ' (防快进作弊) 的事件监听');
+                  return;
+                }
+                return rawMediaAddEventListener.call(this, type, listener, options);
+              };
+            } catch(e) {}
+
+            // 0.02 核心绝杀：全局劫持 Vue / Element UI 原型链与弹窗系统，在代码层面直接掐死「学霸君」弹窗！
+            try {
+              const killXueBaJun = function(fn) {
+                return function(message, title, options) {
+                  const txt = typeof message === 'string' ? message : (message && (message.message || message.title)) || '';
+                  if (typeof txt === 'string' && (txt.indexOf('学霸君') > -1 || txt.indexOf('学习行为存在异常') > -1 || txt.indexOf('学习行为') > -1 || txt.indexOf('拖拽') > -1)) {
+                    console.log('[刷课助手-护盾] 💥 成功在函数调用层彻底扼杀「学霸君」弹窗:', txt);
+                    if (options && typeof options.callback === 'function') {
+                      try { options.callback('confirm'); } catch(err) {}
+                    }
+                    return Promise.resolve({ action: 'confirm' });
+                  }
+                  return fn ? fn.apply(this, arguments) : Promise.resolve({ action: 'confirm' });
+                };
+              };
+
+              // 1. 深度劫持 Object.prototype.$alert 与 $msgbox (针对 Webpack 打包的 Vue 实例)
+              let _protoAlert = null;
+              Object.defineProperty(Object.prototype, '$alert', {
+                get: function() { return this.__tb21_alert || _protoAlert; },
+                set: function(fn) {
+                  if (typeof fn === 'function') {
+                    const wrapped = killXueBaJun(fn);
+                    this.__tb21_alert = wrapped;
+                    _protoAlert = wrapped;
+                  } else {
+                    this.__tb21_alert = fn;
+                  }
+                },
+                configurable: true
+              });
+
+              let _protoMsgbox = null;
+              Object.defineProperty(Object.prototype, '$msgbox', {
+                get: function() { return this.__tb21_msgbox || _protoMsgbox; },
+                set: function(fn) {
+                  if (typeof fn === 'function') {
+                    const wrapped = killXueBaJun(fn);
+                    this.__tb21_msgbox = wrapped;
+                    _protoMsgbox = wrapped;
+                  } else {
+                    this.__tb21_msgbox = fn;
+                  }
+                },
+                configurable: true
+              });
+
+              // 2. 劫持 window.ELEMENT.MessageBox (防全局注入)
+              if (window.ELEMENT && window.ELEMENT.MessageBox) {
+                window.ELEMENT.MessageBox.alert = killXueBaJun(window.ELEMENT.MessageBox.alert);
+                window.ELEMENT.MessageBox.confirm = killXueBaJun(window.ELEMENT.MessageBox.confirm);
+              }
+              let _elem = window.ELEMENT;
+              Object.defineProperty(window, 'ELEMENT', {
+                get: function() { return _elem; },
+                set: function(v) {
+                  _elem = v;
+                  if (v && v.MessageBox) {
+                    v.MessageBox.alert = killXueBaJun(v.MessageBox.alert);
+                    v.MessageBox.confirm = killXueBaJun(v.MessageBox.confirm);
+                  }
+                },
+                configurable: true
+              });
+            } catch(e) {}
+
             // 0.1 核心底层防御：在页面真实主上下文劫持 currentTime，坚决拦截平台尝试拉回/重置进度（包括拉回到0）
             try {
               const origTimeDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
@@ -73,9 +157,12 @@
 
             function isTargetApiUrl(url) {
               if (!url || typeof url !== 'string') return false;
-              return url.indexOf('.do') > -1 || url.indexOf('course') > -1 ||
-                     url.indexOf('Study') > -1 || url.indexOf('Setting') > -1 ||
-                     url.indexOf('nms') > -1 || url.indexOf('Config') > -1;
+              const u = url.toLowerCase();
+              return u.indexOf('.do') > -1 || u.indexOf('course') > -1 ||
+                     u.indexOf('study') > -1 || u.indexOf('setting') > -1 ||
+                     u.indexOf('record') > -1 || u.indexOf('rms') > -1 ||
+                     u.indexOf('oim') > -1 || u.indexOf('ubr') > -1 ||
+                     u.indexOf('nms') > -1 || u.indexOf('config') > -1;
             }
 
             XMLHttpRequest.prototype.open = function(method, url) {
@@ -121,16 +208,22 @@
                   if (!currentResponseText) return;
 
                   // 终极防御：凡带有异常/重置/作弊字样的响应，全部强行改写为成功
-                  if (currentResponseText.indexOf('异常') > -1 || currentResponseText.indexOf('重置') > -1 ||
-                      currentResponseText.indexOf('过快') > -1 || currentResponseText.indexOf('作弊') > -1) {
+                  if (currentResponseText.indexOf('异常') > -1 || currentResponseText.indexOf('学霸君') > -1 ||
+                      currentResponseText.indexOf('重置') > -1 || currentResponseText.indexOf('过快') > -1 ||
+                      currentResponseText.indexOf('作弊') > -1) {
                     try {
                       const fakeRes = JSON.parse(currentResponseText);
-                      fakeRes.code = 1001;
+                      fakeRes.code = 0;
                       fakeRes.msg = '操作处理成功';
-                      if (fakeRes.bizResult === null) fakeRes.bizResult = true;
+                      fakeRes.message = 'success';
+                      fakeRes.success = true;
+                      fakeRes.status = 200;
+                      if (fakeRes.bizResult === null || fakeRes.bizResult === undefined) fakeRes.bizResult = true;
                       modifiedResponse = JSON.stringify(fakeRes);
-                      console.log('🛡️ [刷课助手-护盾] 成功拦截服务器异常指令(XHR):', this._url);
-                    } catch (e) {}
+                      console.log('🛡️ [刷课助手-护盾] 成功拦截并消灭服务器异常/学霸君指令(XHR):', this._url);
+                    } catch (e) {
+                      modifiedResponse = JSON.stringify({ code: 0, status: 200, success: true, msg: "success", bizResult: true });
+                    }
                   }
 
                   // 核心破解：允许高倍速、允许拖拽、关闭反作弊、清空最低学习时间
@@ -208,17 +301,24 @@
                 let isModified = false;
                 let fakeStatus = response.status;
 
-                if (text && (text.includes('异常') || text.includes('重置') || text.includes('过快') || text.includes('作弊'))) {
+                if (text && (text.includes('异常') || text.includes('学霸君') || text.includes('重置') || text.includes('过快') || text.includes('作弊'))) {
                   try {
                     const fakeRes = JSON.parse(text);
-                    fakeRes.code = 1001;
+                    fakeRes.code = 0;
                     fakeRes.msg = '操作处理成功';
-                    if (fakeRes.bizResult === null) fakeRes.bizResult = true;
+                    fakeRes.message = 'success';
+                    fakeRes.success = true;
+                    fakeRes.status = 200;
+                    if (fakeRes.bizResult === null || fakeRes.bizResult === undefined) fakeRes.bizResult = true;
                     text = JSON.stringify(fakeRes);
                     isModified = true;
                     fakeStatus = 200;
-                    console.log('🛡️ [刷课助手-护盾] 成功拦截服务器异常指令(Fetch):', url);
-                  } catch (e) {}
+                    console.log('🛡️ [刷课助手-护盾] 成功拦截并消灭服务器异常/学霸君指令(Fetch):', url);
+                  } catch (e) {
+                    text = JSON.stringify({ code: 0, status: 200, success: true, msg: "success", bizResult: true });
+                    isModified = true;
+                    fakeStatus = 200;
+                  }
                 }
 
                 if (url.includes('showCourseSettingConfig') || url.includes('showCourseChapter') || url.includes('loadCourseSystemSetting')) {
@@ -1100,6 +1200,52 @@
     if (location.pathname.indexOf('/els/html/courseStudyItem/') !== 0) return;
     fixSessionCookie();
     overrideConfirm();
+    // [核心防御 0ms 强杀] MutationObserver 实时监听 DOM 树，学霸君弹窗一旦生成 0ms 瞬间抹杀并恢复播放
+    try {
+      const fastKillerObserver = new MutationObserver(function (mutations) {
+        const boxes = document.querySelectorAll('.el-message-box__wrapper, .el-message-box, .pCheat-box');
+        boxes.forEach(function (box) {
+          const txt = box.textContent || '';
+          if (txt.indexOf('学霸君') > -1 || txt.indexOf('学习行为') > -1 || txt.indexOf('存在异常') > -1) {
+            console.log('[刷课助手-护盾] ⚡ MutationObserver 0ms 瞬间强杀「学霸君」弹窗！');
+            const btn = box.querySelector('.el-button--primary, .el-button, button');
+            if (btn) {
+              try { btn.click(); } catch (e) {}
+            }
+            try { box.remove(); } catch (e) {}
+            // 清除全屏半透明遮罩层
+            document.querySelectorAll('.v-modal, .el-popup-parent--hidden').forEach(function (m) {
+              try { m.remove(); } catch (e) {}
+            });
+            document.body.classList.remove('el-popup-parent--hidden');
+            // 确保视频保持播放，绝不被暂停
+            const v = getVideo ? getVideo() : document.querySelector('video');
+            if (v && v.paused && !v.ended) {
+              v.play().catch(function () {});
+            }
+          }
+        });
+      });
+      fastKillerObserver.observe(document.documentElement || document.body, { childList: true, subtree: true });
+    } catch(e) {}
+
+    try {
+      const parentFastKiller = new MutationObserver(function () {
+        const boxes = document.querySelectorAll('.el-message-box__wrapper, .el-message-box, .modal');
+        boxes.forEach(function (box) {
+          const txt = box.textContent || '';
+          if (txt.indexOf('学霸君') > -1 || txt.indexOf('学习行为') > -1 || txt.indexOf('存在异常') > -1) {
+            console.log('[刷课助手-父页面] ⚡ 0ms 强杀父页面「学霸君」弹窗！');
+            const btn = box.querySelector('.el-button--primary, button');
+            if (btn) { try { btn.click(); } catch(e){} }
+            try { box.remove(); } catch(e){}
+            document.querySelectorAll('.v-modal').forEach(function (m) { try { m.remove(); } catch(e){} });
+          }
+        });
+      });
+      parentFastKiller.observe(document.documentElement || document.body, { childList: true, subtree: true });
+    } catch(e) {}
+
     setInterval(autoDismissMessageBox, 1500);
     setInterval(activityKeeper, 30000);
 
@@ -2580,6 +2726,54 @@
     fixSessionCookie();
     overrideConfirm();
 
+    // [播放页 0ms 强杀] 在播放器 iframe 内部实时监听 DOM 树，学霸君/异常弹窗一旦注入 0ms 强杀并恢复播放
+    try {
+      const iframeFastKiller = new MutationObserver(function () {
+        const boxes = document.querySelectorAll('.el-message-box__wrapper, .el-message-box, .pCheat-box, .hangUp-box');
+        boxes.forEach(function (box) {
+          const txt = box.textContent || '';
+          if (txt.indexOf('学霸君') > -1 || txt.indexOf('学习行为') > -1 || txt.indexOf('存在异常') > -1 || txt.indexOf('拖拽') > -1) {
+            console.log('[刷课助手-播放页护盾] ⚡ MutationObserver 0ms 瞬间强杀「学霸君/拖拽」弹窗！');
+            const btn = box.querySelector('.el-button--primary, .el-button, button');
+            if (btn) {
+              try { btn.click(); } catch (e) {}
+            }
+            try { box.remove(); } catch (e) {}
+            document.querySelectorAll('.v-modal, .el-popup-parent--hidden').forEach(function (m) {
+              try { m.remove(); } catch (e) {}
+            });
+            if (document.body) document.body.classList.remove('el-popup-parent--hidden');
+            const v = getVideo ? getVideo() : document.querySelector('video');
+            if (v && v.paused && !v.ended) {
+              v.play().catch(function () {});
+            }
+          }
+        });
+      });
+      iframeFastKiller.observe(document.documentElement || document.body, { childList: true, subtree: true });
+    } catch(e) {}
+
+    // [Vue 播放器属性强制解锁] 遍历 Vue 播放器组件，把 allowDrag / allowHighSpeed 设为 true，关闭 preventCheatFlag
+    function unlockVuePlayerInstance() {
+      try {
+        const rootEl = document.getElementById('app');
+        if (!rootEl || !rootEl.__vue__) return;
+        function unlockComponent(vm) {
+          if (!vm) return;
+          if ('allowDrag' in vm) vm.allowDrag = true;
+          if ('allowHighSpeed' in vm) vm.allowHighSpeed = true;
+          if ('preventCheatFlag' in vm) vm.preventCheatFlag = false;
+          if ('hangUpFlag' in vm) vm.hangUpFlag = false;
+          if ('mustReplayCanFinish' in vm) vm.mustReplayCanFinish = false;
+          if (vm.$children && vm.$children.length) {
+            vm.$children.forEach(unlockComponent);
+          }
+        }
+        unlockComponent(rootEl.__vue__);
+      } catch(e) {}
+    }
+    setInterval(unlockVuePlayerInstance, 1000);
+
     /* ---------- 播放前静音：避免 autoplay 先出声、轮询随后才静音 ---------- */
     function forceMuteBeforePlay(media) {
       if (!media || !S.autoMute) return;
@@ -3637,6 +3831,21 @@
 
           if (nextTime < dur - 2.5) {
             v.currentTime = nextTime;
+            // 同步更新 Vue 组件内部记录的 seek 位置，使 (t - this.seek > 3) 判定永远为 false！
+            try {
+              const rootEl = document.getElementById('app');
+              if (rootEl && rootEl.__vue__) {
+                function syncSeek(vm) {
+                  if (!vm) return;
+                  if ('seek' in vm) vm.seek = nextTime;
+                  if ('allowDrag' in vm) vm.allowDrag = true;
+                  if (vm.$children && vm.$children.length) {
+                    vm.$children.forEach(syncSeek);
+                  }
+                }
+                syncSeek(rootEl.__vue__);
+              }
+            } catch(e) {}
             triggerStudyLogReport(v);
             rushStepCount++;
             const pct = Math.round((nextTime / dur) * 100);
