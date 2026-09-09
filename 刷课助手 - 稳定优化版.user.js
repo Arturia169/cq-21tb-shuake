@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.15.0
+// @version      1.15.1
 // @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -1612,6 +1612,97 @@
     try { localStorage.setItem(AUTO_KEY_DETAIL_URL, url); } catch (e) {}
   }
 
+  /* ---------- 🚀 纯后台静默舰队看板组件 (顶级通用组件) ---------- */
+  function renderFleetDashboard() {
+    const panel = cachedEl('tb21-auto-panel');
+    if (!panel) return;
+    const body = panel.querySelector('.ap-body');
+    if (!body) return;
+    let fleetBox = body.querySelector('.ap-fleet-box');
+    if (!fleetBox) {
+      fleetBox = document.createElement('div');
+      fleetBox.className = 'ap-fleet-box';
+      const infoEl = body.querySelector('.ap-info');
+      if (infoEl) body.insertBefore(fleetBox, infoEl);
+      else body.appendChild(fleetBox);
+    }
+
+    const isFleetActive = HeadlessFleetManager.isFleetRunning();
+    const isDetailRoute = location.hash && location.hash.indexOf('courseDetail') > -1;
+
+    // 智能布局：在大类目页面且静默舰队未启动时，自动隐藏舰队框，优先把完整视觉空间留给年度大类目攻坚排期
+    if (!isFleetActive && !isDetailRoute) {
+      fleetBox.style.display = 'none';
+      return;
+    }
+    fleetBox.style.display = 'block';
+
+    const conc = HeadlessFleetManager.getConcurrency();
+    const workers = HeadlessFleetManager.getActiveWorkersStatus();
+    const qCount = HeadlessFleetManager.getQueueCount();
+    const cCount = HeadlessFleetManager.getCompletedCount();
+
+    let cardsHtml = '';
+    if (!isFleetActive) {
+      cardsHtml = '<div class="ap-fleet-empty">静默舰队未启动（勾选开启0%CPU多课并发）</div>';
+    } else if (workers.length === 0) {
+      cardsHtml = '<div class="ap-fleet-empty">' + (qCount > 0 ? ('正在调度队列中 ' + qCount + ' 门课程...') : '队列暂无待刷课程') + '</div>';
+    } else {
+      workers.forEach(function (w) {
+        cardsHtml +=
+          '<div class="ap-fleet-card">' +
+            '<div class="ap-fleet-card-title">' +
+              '<span class="ap-fleet-cname" title="' + w.courseTitle + '">' + w.courseTitle + '</span>' +
+              '<span class="ap-fleet-time">⏱️ ' + w.remainText + '</span>' +
+            '</div>' +
+            '<div class="ap-fleet-card-sub">' +
+              '<span>' + (w.totalSections > 0 ? ('第' + w.sectionIndex + '/' + w.totalSections + '节: ' + w.sectionName) : '准备中') + '</span>' +
+              '<span>' + w.percent + '%</span>' +
+            '</div>' +
+            '<div class="ap-fleet-track">' +
+              '<div class="ap-fleet-bar" style="width:' + w.percent + '%"></div>' +
+            '</div>' +
+          '</div>';
+      });
+    }
+
+    fleetBox.innerHTML =
+      '<div class="ap-fleet-header">' +
+        '<label class="ap-fleet-label" title="开启后无需打开播放页，全部在当前标签页纯后台0%CPU静默多课并发刷课">' +
+          '<input type="checkbox" id="tb21-headless-toggle"' + (isFleetActive ? ' checked' : '') + '>' +
+          '<span>🚀 纯后台静默舰队</span>' +
+        '</label>' +
+        '<div class="ap-fleet-conc-btns">' +
+          '<button class="ap-conc-btn' + (conc === 2 ? ' active' : '') + '" data-conc="2" title="并发2门">2</button>' +
+          '<button class="ap-conc-btn' + (conc === 3 ? ' active' : '') + '" data-conc="3" title="并发3门(推荐)">3</button>' +
+          '<button class="ap-conc-btn' + (conc === 5 ? ' active' : '') + '" data-conc="5" title="并发5门">5</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="ap-fleet-list">' + cardsHtml + '</div>' +
+      (isFleetActive ? ('<div style="font-size:10px;color:#64748b;margin-top:4px;display:flex;justify-content:space-between;"><span>已结课: ' + cCount + ' 门</span><span>排队中: ' + qCount + ' 门</span></div>') : '');
+
+    const toggle = fleetBox.querySelector('#tb21-headless-toggle');
+    if (toggle) {
+      toggle.addEventListener('change', function () {
+        if (toggle.checked) {
+          HeadlessFleetManager.start();
+        } else {
+          HeadlessFleetManager.stop();
+        }
+        renderFleetDashboard();
+      });
+    }
+
+    fleetBox.querySelectorAll('.ap-conc-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        const c = parseInt(btn.dataset.conc, 10);
+        HeadlessFleetManager.setConcurrency(c);
+        renderFleetDashboard();
+      });
+    });
+  }
+  HeadlessFleetManager.onUpdate(renderFleetDashboard);
+
   // 列表页/详情页共用的小型控制面板
   function buildAutoPanel(extraInfo) {
     const existingPanel = cachedEl('tb21-auto-panel');
@@ -3045,88 +3136,6 @@
       const infoText = info ? info.textContent : '';
       return card.textContent.replace(infoText, '').trim().replace(/\s+/g, ' ').slice(0, 50);
     }
-    /* ---------- 🚀 纯后台静默舰队看板组件 ---------- */
-    function renderFleetDashboard() {
-      const panel = cachedEl('tb21-auto-panel');
-      if (!panel) return;
-      const body = panel.querySelector('.ap-body');
-      if (!body) return;
-      let fleetBox = body.querySelector('.ap-fleet-box');
-      if (!fleetBox) {
-        fleetBox = document.createElement('div');
-        fleetBox.className = 'ap-fleet-box';
-        const infoEl = body.querySelector('.ap-info');
-        if (infoEl) body.insertBefore(fleetBox, infoEl);
-        else body.appendChild(fleetBox);
-      }
-
-      const isFleetActive = HeadlessFleetManager.isFleetRunning();
-      const conc = HeadlessFleetManager.getConcurrency();
-      const workers = HeadlessFleetManager.getActiveWorkersStatus();
-      const qCount = HeadlessFleetManager.getQueueCount();
-      const cCount = HeadlessFleetManager.getCompletedCount();
-
-      let cardsHtml = '';
-      if (!isFleetActive) {
-        cardsHtml = '<div class="ap-fleet-empty">静默舰队未启动（勾选开启0%CPU多课并发）</div>';
-      } else if (workers.length === 0) {
-        cardsHtml = '<div class="ap-fleet-empty">' + (qCount > 0 ? ('正在调度队列中 ' + qCount + ' 门课程...') : '队列暂无待刷课程') + '</div>';
-      } else {
-        workers.forEach(function (w) {
-          cardsHtml +=
-            '<div class="ap-fleet-card">' +
-              '<div class="ap-fleet-card-title">' +
-                '<span class="ap-fleet-cname" title="' + w.courseTitle + '">' + w.courseTitle + '</span>' +
-                '<span class="ap-fleet-time">⏱️ ' + w.remainText + '</span>' +
-              '</div>' +
-              '<div class="ap-fleet-card-sub">' +
-                '<span>' + (w.totalSections > 0 ? ('第' + w.sectionIndex + '/' + w.totalSections + '节: ' + w.sectionName) : '准备中') + '</span>' +
-                '<span>' + w.percent + '%</span>' +
-              '</div>' +
-              '<div class="ap-fleet-track">' +
-                '<div class="ap-fleet-bar" style="width:' + w.percent + '%"></div>' +
-              '</div>' +
-            '</div>';
-        });
-      }
-
-      fleetBox.innerHTML =
-        '<div class="ap-fleet-header">' +
-          '<label class="ap-fleet-label" title="开启后无需打开播放页，全部在当前标签页纯后台0%CPU静默多课并发刷课">' +
-            '<input type="checkbox" id="tb21-headless-toggle"' + (isFleetActive ? ' checked' : '') + '>' +
-            '<span>🚀 纯后台静默舰队</span>' +
-          '</label>' +
-          '<div class="ap-fleet-conc-btns">' +
-            '<button class="ap-conc-btn' + (conc === 2 ? ' active' : '') + '" data-conc="2" title="并发2门">2</button>' +
-            '<button class="ap-conc-btn' + (conc === 3 ? ' active' : '') + '" data-conc="3" title="并发3门(推荐)">3</button>' +
-            '<button class="ap-conc-btn' + (conc === 5 ? ' active' : '') + '" data-conc="5" title="并发5门">5</button>' +
-          '</div>' +
-        '</div>' +
-        '<div class="ap-fleet-list">' + cardsHtml + '</div>' +
-        (isFleetActive ? ('<div style="font-size:10px;color:#64748b;margin-top:4px;display:flex;justify-content:space-between;"><span>已结课: ' + cCount + ' 门</span><span>排队中: ' + qCount + ' 门</span></div>') : '');
-
-      const toggle = fleetBox.querySelector('#tb21-headless-toggle');
-      if (toggle) {
-        toggle.addEventListener('change', function () {
-          if (toggle.checked) {
-            HeadlessFleetManager.start();
-          } else {
-            HeadlessFleetManager.stop();
-          }
-          renderFleetDashboard();
-        });
-      }
-
-      fleetBox.querySelectorAll('.ap-conc-btn').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          const c = parseInt(btn.dataset.conc, 10);
-          HeadlessFleetManager.setConcurrency(c);
-          renderFleetDashboard();
-        });
-      });
-    }
-    HeadlessFleetManager.onUpdate(renderFleetDashboard);
-
     function buildCourseList() {
       const panel = cachedEl('tb21-auto-panel');
       if (!panel) return;
