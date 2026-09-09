@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.15.7
+// @version      1.15.8
 // @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://testingcf.jsdelivr.net/gh/Arturia169/cq-21tb-shuake@main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -1374,8 +1374,9 @@
           return;
         }
 
-        // 2. 获取已有记录
+        // 2. 获取已有记录与已学秒数
         const recordMap = {};
+        const recordStudyTimeMap = {};
         const finishMap = {};
         try {
           const recData = await TbApiClient.post('/tbc-rms/record/getStudyRecordList', {
@@ -1387,25 +1388,41 @@
             recData.bizResult.forEach(function (r) {
               if (r.resourceId) {
                 recordMap[r.resourceId] = r.recordId;
-                if (r.confirmFinish === 1) finishMap[r.resourceId] = true;
+                const pastTime = Number(r.currentStudyTime || r.currentPosition || 0);
+                recordStudyTimeMap[r.resourceId] = pastTime;
+                if (r.confirmFinish === 1 || r.finish === 1 || (r.timeToFinish > 0 && pastTime >= r.timeToFinish * 0.95)) {
+                  finishMap[r.resourceId] = true;
+                }
               }
             });
           }
         } catch (e) {}
 
-        // 3. 汇总未完成小节
+        // 3. 汇总未完成小节（融合官方进度与本地毫秒级断点记录，刷新后 100% 无缝续刷！）
         const pendingList = [];
         chapData.bizResult.forEach(function (chap) {
           if (chap && Array.isArray(chap.resourceDTOS)) {
             chap.resourceDTOS.forEach(function (res) {
-              if (!finishMap[res.resourceId] && !res.confirmFinish && !res.finish) {
+              const localKey = 'tb21_hprogress_' + courseId + '_' + res.resourceId;
+              let localSec = 0;
+              try {
+                const saved = JSON.parse(localStorage.getItem(localKey) || 'null');
+                if (saved && saved.pos && Date.now() - saved.ts < 24 * 3600 * 1000) {
+                  localSec = Number(saved.pos);
+                }
+              } catch (e) {}
+
+              const bestPastTime = Math.max(recordStudyTimeMap[res.resourceId] || 0, localSec);
+              const targetTime = Number(res.timeToFinish || res.minStudyTime || 300);
+
+              if (!finishMap[res.resourceId] && !res.confirmFinish && !res.finish && bestPastTime < targetTime * 0.95) {
                 pendingList.push({
                   chapterId: chap.chapterId,
                   resourceId: res.resourceId,
                   resourceName: res.resourceName || '小节',
                   resourceType: res.resourceType || 'video',
-                  timeToFinish: Number(res.timeToFinish || res.minStudyTime || 300),
-                  currentStudyTime: Number(res.currentStudyTime || 0),
+                  timeToFinish: targetTime,
+                  currentStudyTime: bestPastTime,
                   recordId: recordMap[res.resourceId] || null
                 });
               }
@@ -1530,11 +1547,12 @@
         // 视频类：根据舰队设定的倍速推进（支持 2x 稳健 或 16x 极速冲刺）
         const speed = HeadlessFleetManager.getSpeed ? HeadlessFleetManager.getSpeed() : 16;
         const dur = Math.max(10, sec.timeToFinish);
-        const reqWait = Math.max(3, Math.ceil(dur / speed));
-        const already = sec.currentStudyTime || 0;
-        const remainWait = Math.max(3, Math.ceil((dur - Math.min(dur, already)) / speed));
+        const already = Math.min(dur, sec.currentStudyTime || 0);
+        const remainWait = Math.max(2, Math.ceil((dur - already) / speed));
+        const localKey = 'tb21_hprogress_' + courseId + '_' + sec.resourceId;
         elapsedSec = 0;
         targetSec = remainWait;
+        virtualPos = already;
         state = 'RUNNING';
         notifyStatus();
 
@@ -1570,6 +1588,11 @@
           virtualPos = Math.min(dur, Math.round(already + elapsedSec * speed));
           notifyStatus();
 
+          // 核心突破：秒级持久化断点记录，网页意外刷新或崩溃瞬间恢复，绝不从头再来！
+          try {
+            localStorage.setItem(localKey, JSON.stringify({ pos: virtualPos, ts: Date.now() }));
+          } catch (e) {}
+
           // 每 60 秒心跳保活
           if (elapsedSec % 60 === 0) {
             TbApiClient.get('/ubr/heartbeat/beat', { courseId: courseId }).catch(function () {});
@@ -1596,6 +1619,7 @@
           if (elapsedSec >= remainWait) {
             clearInterval(timer);
             timer = null;
+            try { localStorage.removeItem(localKey); } catch (e) {}
             try {
               await TbApiClient.post('/biz-oim/course/saveStudyLog.do?courseId=' + courseId, {
                 studyLogVO: {
@@ -1722,9 +1746,23 @@
         concurrency = Math.max(1, Math.min(8, parseInt(localStorage.getItem('tb21_headless_concurrency'), 10) || 3));
         speed = parseInt(localStorage.getItem('tb21_headless_speed'), 10) || 16;
         isRunning = localStorage.getItem('tb21_headless_active') === '1';
-      } catch (e) { concurrency = 3; isRunning = false; }
+        const savedCompleted = JSON.parse(localStorage.getItem('tb21_headless_completed_courses') || '[]');
+        if (Array.isArray(savedCompleted)) completedCourses = savedCompleted;
+      } catch (e) { concurrency = 3; isRunning = false; completedCourses = []; }
     }
     loadSettings();
+
+    function isCompleted(cid) {
+      if (!cid) return false;
+      const strCid = String(cid);
+      if (completedCourses.indexOf(strCid) > -1) return true;
+      try {
+        const saved = JSON.parse(localStorage.getItem('tb21_headless_completed_courses') || '[]');
+        if (Array.isArray(saved) && saved.indexOf(strCid) > -1) return true;
+      } catch (e) {}
+      if (typeof hasFreshAutoKey === 'function' && hasFreshAutoKey(AUTO_KEY_DONE_COURSES, strCid)) return true;
+      return false;
+    }
 
     function setConcurrency(c) {
       concurrency = Math.max(1, Math.min(8, c));
@@ -1746,9 +1784,9 @@
     function addCourse(courseInfo) {
       if (!courseInfo || !courseInfo.courseId) return;
       const cid = String(courseInfo.courseId);
+      if (isCompleted(cid)) return;
       if (queue.some(function (c) { return String(c.courseId) === cid; })) return;
       if (workers.some(function (w) { return String(w.getStatus().courseId) === cid; })) return;
-      if (completedCourses.indexOf(cid) > -1) return;
       queue.push(courseInfo);
       if (isRunning) dispatch();
     }
@@ -1765,7 +1803,16 @@
         const worker = new VirtualCourseWorker(course, {
           onStatusChange: function () { notify(); },
           onComplete: function (cid, title) {
-            completedCourses.push(String(cid));
+            const strCid = String(cid);
+            if (completedCourses.indexOf(strCid) === -1) {
+              completedCourses.push(strCid);
+              try {
+                localStorage.setItem('tb21_headless_completed_courses', JSON.stringify(Array.from(new Set(completedCourses))));
+              } catch (e) {}
+            }
+            if (typeof rememberPendingCourseDone === 'function') {
+              rememberPendingCourseDone(strCid, title);
+            }
             console.log('[刷课助手-静默舰队] 🏆 课程已在纯后台完播结课并核算学分: ' + title);
             try {
               const cards = document.querySelectorAll('.text-item.cursor, .course-item, .box-card');
@@ -1847,6 +1894,7 @@
       getConcurrency: getConcurrency,
       setSpeed: setSpeed,
       getSpeed: getSpeed,
+      isCompleted: isCompleted,
       getActiveWorkersStatus: getActiveWorkersStatus,
       isFleetRunning: isFleetRunning,
       getQueueCount: getQueueCount,
@@ -1959,7 +2007,7 @@
           const domList = JSON.parse(domStr);
           if (Array.isArray(domList)) {
             domList.forEach(function (c) {
-              if (!c.done && c.courseId) {
+              if (!c.done && c.courseId && !HeadlessFleetManager.isCompleted(String(c.courseId))) {
                 fleetCourses.push({
                   courseId: String(c.courseId),
                   title: c.title || ('课程_' + c.courseId),
@@ -1977,10 +2025,11 @@
       if (fleetCourses.length === 0) {
         const cards = document.querySelectorAll('.text-item.cursor, .course-item, .box-card');
         cards.forEach(function (c) {
-          const text = c.textContent || '';
-          if (text.indexOf('已完成') > -1 || c.getAttribute('data-course-done') === '1') return;
           const cid = getCardCourseId(c);
           if (!cid) return;
+          if (HeadlessFleetManager.isCompleted(cid)) return;
+          const text = c.textContent || '';
+          if (text.indexOf('已完成') > -1 || c.getAttribute('data-course-done') === '1') return;
           const titleEl = c.querySelector('.text-title, .title, .course-name, h4, h3, .item__name');
           const title = c.getAttribute('data-course-title') || (titleEl ? titleEl.textContent.trim() : ('课程_' + cid));
           const scoreVal = parseFloat(c.getAttribute('data-course-score') || getCourseCredits(c)) || 0;
@@ -3098,6 +3147,13 @@
       TbApiClient.startSessionHeartbeat();
     }
 
+    // 网页刷新后若静默模式处于开启状态，立即无缝激活调度续刷
+    if (HeadlessFleetManager.isFleetRunning()) {
+      setTimeout(function () {
+        scanAndDispatchFleet();
+      }, 500);
+    }
+
     let apiAllCourses = null;
     let isFetchingAllCourses = false;
     async function tryFetchAllCourses() {
@@ -3142,8 +3198,11 @@
       getVisibleCards().forEach(function (c) {
         const info = c.querySelector('.text-info');
         if (!info) return;
+        const courseId = getCardCourseId(c);
         const txt = info.textContent;
-        const isDone = txt.indexOf('已完成') > -1;
+        const isDone = txt.indexOf('已完成') > -1 ||
+                       c.getAttribute('data-course-done') === '1' ||
+                       (typeof HeadlessFleetManager !== 'undefined' && HeadlessFleetManager.isCompleted(courseId));
         const isRequired = txt.indexOf('必修') > -1;
         const tab = isRequired ? 'required' : 'elective';
         result[tab].total++;
@@ -3422,12 +3481,15 @@
       allCards.forEach(function (c, idx) {
         const info = c.querySelector('.text-info');
         if (!info) return;
+        const cid = getCardCourseId(c);
         const txt = info.textContent;
-        const isDone = txt.indexOf('已完成') > -1;
+        const isDone = txt.indexOf('已完成') > -1 ||
+                       c.getAttribute('data-course-done') === '1' ||
+                       (typeof HeadlessFleetManager !== 'undefined' && HeadlessFleetManager.isCompleted(cid));
         const isRequired = txt.indexOf('必修') > -1;
         const credits = getCourseCredits(c);
         const title = getCourseTitle(c);
-        const courseId = getCardCourseId(c);
+        const courseId = cid;
 
         // 从 CourseMetaStore 获取或触发异步扫描
         const meta = CourseMetaStore.get(courseId);
@@ -3743,8 +3805,8 @@
       cards.forEach(function (c, idx) {
         const info = c.querySelector('.text-info');
         if (!info) return;
-        const txt = info.textContent;
-        if (txt.indexOf('已完成') > -1) {
+        const cid = getCardCourseId(c);
+        if (txt.indexOf('已完成') > -1 || c.getAttribute('data-course-done') === '1' || (typeof HeadlessFleetManager !== 'undefined' && HeadlessFleetManager.isCompleted(cid))) {
           doneItems.push({
             card: c,
             title: getCourseTitle(c),
