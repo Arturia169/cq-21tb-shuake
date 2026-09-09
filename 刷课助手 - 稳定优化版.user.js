@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.14.0
+// @version      1.14.1
 // @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -31,12 +31,23 @@
             window.__tb21_godmode_ready = true;
             console.log('[刷课助手-破解] 🚀 上帝模式与防封护盾已启动...');
 
-            // 0.00 注入防护样式，永久抹杀 50% 时长不足导致的“画面变灰/重新观看”遮罩
+            // 0.00 注入防护样式，永久抹杀 50% 时长不足导致的“画面变灰/重新观看”遮罩与 Element UI 网页变暗背景 (v-modal)
             try {
               const shieldStyle = document.createElement('style');
               shieldStyle.id = 'tb21-shield-style';
-              shieldStyle.textContent = '.player-endInfo.has-replay-btn, .player-replay-tip, .replay-btn, .has-replay-btn { display: none !important; visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; }';
+              shieldStyle.textContent = '.v-modal, .el-message-box__wrapper, .player-endInfo, .player-endInfo.has-replay-btn, .player-replay-tip, .replay-btn, .has-replay-btn { display: none !important; visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; }';
               (document.head || document.documentElement).appendChild(shieldStyle);
+
+              // 物理级移除任何动态挂载的 Element UI 黑色背景遮罩层
+              const purgeModals = function() {
+                const modals = document.querySelectorAll('.v-modal, .el-message-box__wrapper');
+                if (modals && modals.length) {
+                  modals.forEach(function(m) { try { m.remove(); } catch(e) {} });
+                }
+              };
+              purgeModals();
+              const modalObserver = new MutationObserver(purgeModals);
+              modalObserver.observe(document.documentElement, { childList: true, subtree: true });
             } catch(e) {}
 
             // 0. 拦截原生 alert 和 confirm，防止平台报“异常/快进”弹窗打断播放
@@ -161,6 +172,7 @@
             const rawSend = XMLHttpRequest.prototype.send;
             // [性能优化] 属性描述符外层单次提取，避免高频请求重复查找原型链
             const origResponseText = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'responseText');
+            const origResponse = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'response');
             const origStatus = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'status');
 
             function isTargetApiUrl(url) {
@@ -211,11 +223,16 @@
                     if (reqObj && reqObj.timeToFinish) {
                       const v = document.querySelector('video');
                       const isFinishing = (v && (v.ended || (v.duration && v.currentTime >= v.duration - 5))) || window.__tb21_rush_finishing;
+                      let isRush = false;
+                      try { isRush = localStorage.getItem('tb21_helper_rushMode') === 'true' || window.__tb21_rush_finishing; } catch(e) {}
                       if (isFinishing || reqObj.currentPosition >= reqObj.timeToFinish - 10) {
                         reqObj.currentPosition = reqObj.timeToFinish;
                         reqObj.currentStudyTime = Math.max(reqObj.currentStudyTime || 0, Math.round(reqObj.timeToFinish * 0.6));
                         reqData = JSON.stringify(reqObj);
                         console.log('[刷课助手-护盾] 🎯 成功重写 updateCourseRecord(XHR) 为100%完播，破除50%截断:', reqObj.currentPosition);
+                      } else if (isRush && reqObj.currentPosition > 0) {
+                        reqObj.currentStudyTime = Math.max(reqObj.currentStudyTime || 0, Math.round(reqObj.currentPosition * 0.6));
+                        reqData = JSON.stringify(reqObj);
                       }
                     }
                   }
@@ -228,27 +245,30 @@
                   try {
                     if (this.responseType === '' || this.responseType === 'text') {
                       currentResponseText = this.responseText;
+                    } else if (this.responseType === 'json' && this.response) {
+                      currentResponseText = typeof this.response === 'string' ? this.response : JSON.stringify(this.response);
                     }
                   } catch (e) { return; }
 
                   if (!currentResponseText) return;
 
-                  // 终极防御：凡带有异常/重置/作弊字样的响应，全部强行改写为成功
+                  // 终极防御：凡带有异常/重置/作弊/拖拽/50%字样的响应，全部强行改写为1001成功(RMS业务成功码)
                   if (currentResponseText.indexOf('异常') > -1 || currentResponseText.indexOf('学霸君') > -1 ||
                       currentResponseText.indexOf('重置') > -1 || currentResponseText.indexOf('过快') > -1 ||
-                      currentResponseText.indexOf('作弊') > -1) {
+                      currentResponseText.indexOf('作弊') > -1 || currentResponseText.indexOf('拖拽') > -1 ||
+                      currentResponseText.indexOf('50%') > -1) {
                     try {
                       const fakeRes = JSON.parse(currentResponseText);
-                      fakeRes.code = 0;
+                      fakeRes.code = 1001; // 21tb 核心RMS标准成功码，彻底阻止 ab3e 触发 MessageBox.alert
                       fakeRes.msg = '操作处理成功';
                       fakeRes.message = 'success';
                       fakeRes.success = true;
                       fakeRes.status = 200;
                       if (fakeRes.bizResult === null || fakeRes.bizResult === undefined) fakeRes.bizResult = true;
                       modifiedResponse = JSON.stringify(fakeRes);
-                      console.log('🛡️ [刷课助手-护盾] 成功拦截并消灭服务器异常/学霸君指令(XHR):', this._url);
+                      console.log('🛡️ [刷课助手-护盾] 成功拦截并消灭服务器异常/50%风控拦截(XHR):', this._url);
                     } catch (e) {
-                      modifiedResponse = JSON.stringify({ code: 0, status: 200, success: true, msg: "success", bizResult: true });
+                      modifiedResponse = JSON.stringify({ code: 1001, status: 200, success: true, msg: "操作处理成功", bizResult: true });
                     }
                   }
 
@@ -316,11 +336,27 @@
                   });
                 } catch (e) {}
               }
+              if (origResponse) {
+                try {
+                  Object.defineProperty(this, 'response', {
+                    get: function() {
+                      if (modifiedResponse !== null) {
+                        if (this.responseType === 'json') {
+                          try { return JSON.parse(modifiedResponse); } catch(e) { return modifiedResponse; }
+                        }
+                        return modifiedResponse;
+                      }
+                      return origResponse.get.call(this);
+                    },
+                    configurable: true
+                  });
+                } catch (e) {}
+              }
               if (origStatus) {
                 try {
                   Object.defineProperty(this, 'status', {
                     get: function() {
-                      if (modifiedResponse !== null && origStatus.get.call(this) === 500) return 200;
+                      if (modifiedResponse !== null) return 200;
                       return origStatus.get.call(this);
                     },
                     configurable: true
@@ -4619,7 +4655,7 @@
           '<div class="th-row th-switch-row">' +
             '<label class="th-switch-label"><input type="checkbox" id="tb21-autoNext"><span class="th-switch-track"><span class="th-switch-thumb"></span></span><span class="th-switch-txt">自动下一节</span></label>' +
             '<label class="th-switch-label"><input type="checkbox" id="tb21-autoMute"><span class="th-switch-track"><span class="th-switch-thumb"></span></span><span class="th-switch-txt">自动静音</span></label>' +
-            '<label class="th-switch-label rush" title="开启后每2秒向前智能步进推进，15~20秒完成一节课"><input type="checkbox" id="tb21-rushMode"><span class="th-switch-track"><span class="th-switch-thumb"></span></span><span class="th-switch-txt">🚀极速冲刺</span></label>' +
+            '<label class="th-switch-label rush" title="🚀 极速冲刺秒刷：每2秒向前智能推进。注意：长视频(>15min)因21tb后端50%硬校验，建议优先使用【⚡极速性价/最短用时】筛选短视频秒刷，或配合多课同开！"><input type="checkbox" id="tb21-rushMode"><span class="th-switch-track"><span class="th-switch-thumb"></span></span><span class="th-switch-txt">🚀极速冲刺</span></label>' +
           '</div>' +
           '<div class="th-prog"><div class="th-prog-bar"><div class="th-prog-fill"></div></div><div class="th-prog-txt">当前课进度 --</div></div>' +
           '<div class="th-cat-title">📊 类目进度</div>' +
