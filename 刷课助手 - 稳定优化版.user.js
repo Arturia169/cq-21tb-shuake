@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.12.4
+// @version      1.12.5
 // @description  在线课程学习辅助（21tb / 重庆公需课）：倍速播放（2x~16x）、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -2955,7 +2955,8 @@
           const beforeText = getActiveSectionText();
 
           const v = getVideo();
-          if (v && v.duration && v.duration > 0 && !v.ended && (v.duration - v.currentTime > EARLY_FINISH_THRESHOLD)) {
+          // [核心优化] 极速冲刺模式下直接放行，稳健模式下才做假 finish 拦截
+          if (!S.rushMode && v && v.duration && v.duration > 0 && !v.ended && (v.duration - v.currentTime > EARLY_FINISH_THRESHOLD)) {
              console.log('[刷课助手] 拦截到假 finish！当前视频还没看完(剩余' + (v.duration - v.currentTime).toFixed(1) + 's)，拒绝跳转下一节');
              return;
           }
@@ -2980,7 +2981,7 @@
           const beforeText = getActiveSectionText();
 
           const v = getVideo();
-          if (v && v.duration && v.duration > 0 && !v.ended && (v.duration - v.currentTime > 90)) { // 同步放宽到90秒
+          if (!S.rushMode && v && v.duration && v.duration > 0 && !v.ended && (v.duration - v.currentTime > 90)) {
              console.log('[刷课助手] 拦截到兜底假 finish！当前视频还没看完(剩余' + (v.duration - v.currentTime).toFixed(1) + 's)，拒绝跳转下一节');
              return;
           }
@@ -3050,15 +3051,29 @@
       isWaitingNextTime = Date.now(); // 记录锁定时间，用于超时检测
       const v = getVideo();
       if (v && !v.paused) { try { v.pause(); } catch(e){} }
-      console.log('[刷课助手] 检测到视频播放完成，已暂停，等待平台上报进度（最多15秒）');
 
-      // 给当前看过的视频记录一下标识，防止死循环重看
+      // 给当前看过的视频记录已读标识，防止死循环重看
       try {
-         const activeSection = getTrackedActiveSection();
-         if (activeSection) activeSection.dataset.watched = '1';
+        const activeSection = getTrackedActiveSection();
+        if (activeSection) {
+          activeSection.dataset.watched = '1';
+          const sectionItem = activeSection.closest('li.section-item, .chapter-item li, .course-chapter li, .section-box li');
+          if (sectionItem) sectionItem.classList.add('finish', 'is-finish');
+        }
       } catch(e) {}
 
-      // 检查 finish 状态，如果出现 finish 就立刻切，否则每秒查一次
+      // [核心优化] 🚀 极速冲刺模式：0.5 秒闪电切节，绝对不等待平台 15 秒迟钝延迟！
+      if (S.rushMode) {
+        console.log('[刷课助手] 🚀 极速冲刺完成，0.5秒闪电切入下一节（免除15秒死等）！');
+        endingLock = false;
+        setTimeout(function() {
+          tryNext();
+        }, 500);
+        return;
+      }
+
+      console.log('[刷课助手] 检测到视频播放完成，已暂停，等待平台上报进度（稳健模式最多等10秒）');
+      // 稳健模式：检查 finish 状态，出现 finish 立刻切，最多缩减至 10 秒
       let checks = 0;
       const checkInterval = setInterval(function() {
         checks++;
@@ -3066,19 +3081,17 @@
         const activeSection = getTrackedActiveSection();
         if (activeSection) {
           const sectionItem = activeSection.closest('li.section-item, .chapter-item li, .course-chapter li, .section-box li');
-          if (sectionItem) {
-            if (hasFinishedClass(sectionItem)) {
-              isFinish = true;
-            }
+          if (sectionItem && hasFinishedClass(sectionItem)) {
+            isFinish = true;
           }
         }
-        if (isFinish || checks >= 15) { // 最多等 15 秒
+        if (isFinish || checks >= 10) {
           clearInterval(checkInterval);
           if (isFinish) console.log('[刷课助手] 平台已标记finish，开始切节');
           else console.log('[刷课助手] 等待finish超时，强制切节');
           tryNext();
         }
-      }, 1000);
+      }, 800);
       nextTimers.push(checkInterval);
     }
 
@@ -3586,20 +3599,34 @@
             const pct = Math.round((nextTime / dur) * 100);
             console.log('[刷课助手] 🚀 极速冲刺脉冲 #' + rushStepCount + ': 推进至 ' + nextTime.toFixed(1) + 's / ' + dur.toFixed(1) + 's (' + pct + '%)');
           } else {
-            // 阶段 3：尾帧收官完播
+            // 阶段 3：尾帧收官完播，立即闪电切换下一节
             clearInterval(rushTimer);
             rushTimer = null;
             const finishTime = Math.max(0, dur - 0.3);
             v.currentTime = finishTime;
             triggerStudyLogReport(v);
-            console.log('[刷课助手] 🚀 极速冲刺尾帧打点完成，触发自然完播！');
+            console.log('[刷课助手] 🚀 极速冲刺尾帧打点完成，触发自然完播与闪电切节！');
+            
+            // 标记当前小节已读
+            try {
+              const activeSection = getTrackedActiveSection();
+              if (activeSection) {
+                activeSection.dataset.watched = '1';
+                const sectionItem = activeSection.closest('li.section-item, .chapter-item li, .course-chapter li, .section-box li');
+                if (sectionItem) sectionItem.classList.add('finish', 'is-finish');
+              }
+            } catch(e) {}
+
             setTimeout(function () {
               try {
                 if (v && !v.ended) {
                   v.dispatchEvent(new Event('ended'));
                 }
               } catch (e) {}
-            }, 500);
+              // 解除锁定并立即触发切节
+              endingLock = false;
+              tryNext();
+            }, 400);
           }
         }, 2200); // 每 2.2 秒脉冲推进一次，15~18 秒通关
       }
