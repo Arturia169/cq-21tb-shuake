@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.15.4
+// @version      1.15.5
 // @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://testingcf.jsdelivr.net/gh/Arturia169/cq-21tb-shuake@main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -1460,11 +1460,12 @@
           return;
         }
 
-        // 视频类：合规 2.0x 虚拟时钟推进（单次不少于50%物理时长）
+        // 视频类：根据舰队设定的倍速推进（支持 2x 稳健 或 16x 极速冲刺）
+        const speed = HeadlessFleetManager.getSpeed ? HeadlessFleetManager.getSpeed() : 16;
         const dur = Math.max(10, sec.timeToFinish);
-        const reqWait = Math.ceil(dur * 0.5);
+        const reqWait = Math.max(3, Math.ceil(dur / speed));
         const already = sec.currentStudyTime || 0;
-        const remainWait = Math.max(12, reqWait - already);
+        const remainWait = Math.max(3, Math.ceil((dur - Math.min(dur, already)) / speed));
         elapsedSec = 0;
         targetSec = remainWait;
         state = 'RUNNING';
@@ -1499,7 +1500,7 @@
             return;
           }
           elapsedSec++;
-          virtualPos = Math.min(dur, Math.round(already * 2 + elapsedSec * 2));
+          virtualPos = Math.min(dur, Math.round(already + elapsedSec * speed));
           notifyStatus();
 
           // 每 60 秒心跳保活
@@ -1595,6 +1596,7 @@
   const HeadlessFleetManager = (function () {
     let isRunning = false;
     let concurrency = 3;
+    let speed = 16;
     let queue = [];
     let workers = [];
     let completedCourses = [];
@@ -1603,6 +1605,7 @@
     function loadSettings() {
       try {
         concurrency = Math.max(1, Math.min(8, parseInt(localStorage.getItem('tb21_headless_concurrency'), 10) || 3));
+        speed = parseInt(localStorage.getItem('tb21_headless_speed'), 10) || 16;
         isRunning = localStorage.getItem('tb21_headless_active') === '1';
       } catch (e) { concurrency = 3; isRunning = false; }
     }
@@ -1616,6 +1619,14 @@
     }
 
     function getConcurrency() { return concurrency; }
+
+    function setSpeed(s) {
+      speed = Math.max(1, Math.min(32, s));
+      try { localStorage.setItem('tb21_headless_speed', String(speed)); } catch (e) {}
+      notify();
+    }
+
+    function getSpeed() { return speed; }
 
     function addCourse(courseInfo) {
       if (!courseInfo || !courseInfo.courseId) return;
@@ -1708,6 +1719,8 @@
       setCourses: setCourses,
       setConcurrency: setConcurrency,
       getConcurrency: getConcurrency,
+      setSpeed: setSpeed,
+      getSpeed: getSpeed,
       getActiveWorkersStatus: getActiveWorkersStatus,
       isFleetRunning: isFleetRunning,
       getQueueCount: getQueueCount,
@@ -1910,7 +1923,8 @@
     }
     fleetBox.style.display = 'block';
 
-    const conc = HeadlessFleetManager.getConcurrency();
+const conc = HeadlessFleetManager.getConcurrency();
+    const speed = HeadlessFleetManager.getSpeed ? HeadlessFleetManager.getSpeed() : 16;
     const workers = HeadlessFleetManager.getActiveWorkersStatus();
     const qCount = HeadlessFleetManager.getQueueCount();
     const cCount = HeadlessFleetManager.getCompletedCount();
@@ -1953,9 +1967,16 @@
       '<div class="ap-fleet-conc-row">' +
         '<span class="ap-fleet-conc-title" title="后台同时挂机的课程数量">并发路数:</span>' +
         '<div class="ap-fleet-conc-btns">' +
-          '<button class="ap-conc-btn' + (conc === 2 ? ' active' : '') + '" data-conc="2" title="同时静默挂机2门课：平稳低调">2门</button>' +
-          '<button class="ap-conc-btn' + (conc === 3 ? ' active' : '') + '" data-conc="3" title="同时静默挂机3门课(系统推荐)：效率提升3倍且最稳定">3门(推荐) ★</button>' +
-          '<button class="ap-conc-btn' + (conc === 5 ? ' active' : '') + '" data-conc="5" title="同时静默挂机5门课：极速冲刺，效率提升5倍">5门</button>' +
+          '<button class="ap-conc-btn' + (conc === 2 ? ' active' : '') + '" data-conc="2" title="同时静默挂机2门课">2门</button>' +
+          '<button class="ap-conc-btn' + (conc === 3 ? ' active' : '') + '" data-conc="3" title="同时静默挂机3门课(推荐)">3门(推荐)</button>' +
+          '<button class="ap-conc-btn' + (conc === 5 ? ' active' : '') + '" data-conc="5" title="同时静默挂机5门课">5门</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="ap-fleet-conc-row" style="margin-top:2px;">' +
+        '<span class="ap-fleet-conc-title" title="每门静默课程的虚拟时钟推进倍速">单课倍速:</span>' +
+        '<div class="ap-fleet-conc-btns">' +
+          '<button class="ap-speed-btn' + (speed === 2 ? ' active' : '') + '" data-speed="2" title="2x 稳健模式（单课2x，3门并发等效6x）">2x稳健</button>' +
+          '<button class="ap-speed-btn' + (speed === 16 ? ' active' : '') + '" data-speed="16" title="16x 极速冲刺模式（单课16x，3门并发等效48x，5门并发等效80x！）" style="color:' + (speed === 16 ? '#fff' : '#f59e0b') + '">⚡ 16x狂飙(等效48x~80x) ★</button>' +
         '</div>' +
       '</div>' +
       '<div class="ap-fleet-list">' + cardsHtml + '</div>' +
@@ -1985,6 +2006,14 @@
         renderFleetDashboard();
       });
     }
+
+    fleetBox.querySelectorAll('.ap-speed-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        const s = parseInt(btn.dataset.speed, 10);
+        HeadlessFleetManager.setSpeed(s);
+        renderFleetDashboard();
+      });
+    });
 
     fleetBox.querySelectorAll('.ap-conc-btn').forEach(function (btn) {
       btn.addEventListener('click', function () {
@@ -2055,7 +2084,9 @@
       #tb21-auto-panel .ap-fleet-conc-row{display:flex;align-items:center;justify-content:space-between;margin:4px 0 6px;padding:4px 6px;background:rgba(255,255,255,.03);border-radius:6px;border:1px solid rgba(255,255,255,.05)}
       #tb21-auto-panel .ap-fleet-conc-title{font-size:10px;color:#94a3b8;font-weight:600}
       #tb21-auto-panel .ap-fleet-conc-btns{display:flex;align-items:center;gap:4px}
-      #tb21-auto-panel .ap-conc-btn{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#94a3b8;font-size:10px;padding:2px 6px;border-radius:4px;cursor:pointer;transition:all .2s;white-space:nowrap}
+      #tb21-auto-panel .ap-conc-btn,#tb21-auto-panel .ap-speed-btn{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#94a3b8;font-size:10px;padding:2px 6px;border-radius:4px;cursor:pointer;transition:all .2s;white-space:nowrap}
+      #tb21-auto-panel .ap-speed-btn:hover{color:#fff;background:rgba(255,255,255,.14)}
+      #tb21-auto-panel .ap-speed-btn.active{background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;border-color:#fbbf24;font-weight:700;box-shadow:0 0 8px rgba(245,158,11,.4)}
       #tb21-auto-panel .ap-conc-btn:hover{color:#fff;background:rgba(255,255,255,.14)}
       #tb21-auto-panel .ap-conc-btn.active{background:linear-gradient(135deg,#0284c7,#0369a1);color:#fff;border-color:#38bdf8;font-weight:700;box-shadow:0 0 8px rgba(56,189,248,.35)}
       #tb21-auto-panel .ap-fleet-list{display:flex;flex-direction:column;gap:5px;max-height:160px;overflow-y:auto;padding-right:2px}
