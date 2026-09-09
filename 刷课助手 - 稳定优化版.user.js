@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.15.3
+// @version      1.15.4
 // @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://testingcf.jsdelivr.net/gh/Arturia169/cq-21tb-shuake@main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -31,37 +31,74 @@
             window.__tb21_godmode_ready = true;
             console.log('[刷课助手-破解] 🚀 上帝模式与防封护盾已启动...');
 
-            // 0.000 穿透 DOM 隔离：实时为课程卡片注入真实 courseId 与元数据 (主上下文无阻穿透)
+            // 0.000 穿透 Vue 组件树：实时获取全局未学课程、打桩 DOM 与桥接跨沙箱数据 (主上下文特权)
             try {
-              const stampCourses = function() {
-                const cards = document.querySelectorAll('.text-item.cursor');
-                const list = [];
-                cards.forEach(function(card) {
-                  try {
-                    let ci = null;
-                    if (card.__vue__ && card.__vue__.courseInfo) {
-                      ci = card.__vue__.courseInfo;
-                    } else if (card.parentElement && card.parentElement.__vue__ && card.parentElement.__vue__.courseInfo) {
-                      ci = card.parentElement.__vue__.courseInfo;
+              const getCourseDetailVm = function() {
+                const refundEl = document.querySelector('.refund, .courseDetail, .course-detail');
+                if (refundEl && refundEl.__vue__) return refundEl.__vue__;
+                const app = document.querySelector('#app');
+                if (app && app.__vue__) {
+                  const queue = [app.__vue__];
+                  let steps = 0;
+                  while (queue.length > 0 && steps < 300) {
+                    steps++;
+                    const cur = queue.shift();
+                    if (cur && (cur.courseInfoMustList || cur.courseInfoSelectiveList || cur.getMustCourseDetailByProjectId)) {
+                      return cur;
                     }
-                    if (ci && ci.courseId) {
-                      const cid = String(ci.courseId);
-                      card.setAttribute('data-course-id', cid);
-                      if (ci.courseTitle) card.setAttribute('data-course-title', ci.courseTitle);
-                      if (ci.courseScore) card.setAttribute('data-course-score', String(ci.courseScore));
-                      const text = card.textContent || '';
-                      const isDone = text.indexOf('已完成') > -1 || (card.__vue__ && (card.__vue__.schedule >= 100 || card.__vue__.status === 2));
-                      card.setAttribute('data-course-done', isDone ? '1' : '0');
-                      list.push({ courseId: cid, title: ci.courseTitle || '', done: isDone });
+                    if (cur && cur.$children && cur.$children.length) {
+                      for (let i = 0; i < cur.$children.length; i++) queue.push(cur.$children[i]);
                     }
-                  } catch(e) {}
-                });
-                if (list.length > 0) {
-                  try { sessionStorage.setItem('tb21_dom_courses', JSON.stringify(list)); } catch(e) {}
+                  }
                 }
+                return null;
               };
-              stampCourses();
-              setInterval(stampCourses, 800);
+
+              const syncCoursesFromVue = function() {
+                try {
+                  const vm = getCourseDetailVm();
+                  if (!vm) return;
+                  const must = vm.courseInfoMustList || [];
+                  const ele = vm.courseInfoSelectiveList || [];
+                  const allList = [];
+                  must.concat(ele).forEach(function(item) {
+                    if (item && item.courseInfo && item.courseInfo.courseId) {
+                      const ci = item.courseInfo;
+                      const rate = String(item.currentStepRate || '');
+                      const isDone = rate.indexOf('100') > -1 || rate.indexOf('已完成') > -1 || ci.schedule >= 100 || ci.status === 2;
+                      allList.push({
+                        courseId: String(ci.courseId),
+                        title: ci.courseTitle || ('课程_' + ci.courseId),
+                        score: ci.courseScore || 0,
+                        done: isDone
+                      });
+                    }
+                  });
+                  if (allList.length > 0) {
+                    sessionStorage.setItem('tb21_dom_courses', JSON.stringify(allList));
+                    window.__tb21_vm_courses = allList;
+                  }
+                  if (vm.roadMapId) sessionStorage.setItem('tb21_current_roadmap_id', String(vm.roadMapId));
+                  if (vm.currentStageId) sessionStorage.setItem('tb21_current_stage_id', String(vm.currentStageId));
+
+                  // 对应 DOM 卡片逐一打桩
+                  const curList = (vm.activeName === 'SELECTIVE' ? ele : must);
+                  const cards = document.querySelectorAll('.text-item.cursor');
+                  cards.forEach(function(card, idx) {
+                    const item = curList[idx];
+                    if (item && item.courseInfo && item.courseInfo.courseId) {
+                      card.setAttribute('data-course-id', String(item.courseInfo.courseId));
+                      card.setAttribute('data-course-title', item.courseInfo.courseTitle || '');
+                      const rate = String(item.currentStepRate || card.textContent || '');
+                      const isDone = rate.indexOf('100') > -1 || rate.indexOf('已完成') > -1;
+                      card.setAttribute('data-course-done', isDone ? '1' : '0');
+                    }
+                  });
+                } catch(e) {}
+              };
+
+              syncCoursesFromVue();
+              setInterval(syncCoursesFromVue, 600);
             } catch(e) {}
 
             // 0.00 注入防护样式，永久抹杀 50% 时长不足导致的“画面变灰/重新观看”遮罩与 Element UI 网页变暗背景 (v-modal)
@@ -985,17 +1022,32 @@
     }
 
     // 4.1 官方全量未完成课程精准直连拉取 (优先用于静默舰队与智能规划)
-    async function fetchDetailCourses(projectId) {
-      if (!projectId) return [];
+    async function fetchDetailCourses(projectId, roadMapId) {
       try {
-        const stageRes = await get('/nms/html/courseStudy/getRmStageByProjectId.do', { projectId: projectId });
-        const stages = (stageRes && Array.isArray(stageRes)) ? stageRes : [{}];
+        const q = getRouteQueryParams();
+        const rmId = roadMapId || q.roadMapId || sessionStorage.getItem('tb21_current_roadmap_id') || '';
+        const pId = projectId || q.projectId || '';
+
+        let stages = [];
+        if (rmId) {
+          const stageRes = await get('/nms/html/courseStudy/getRmStageByProjectId.do', { roadMapId: rmId });
+          if (stageRes && Array.isArray(stageRes)) stages = stageRes;
+        }
+        if (stages.length === 0 && pId) {
+          const stageRes2 = await get('/nms/html/courseStudy/getRmStageByProjectId.do', { projectId: pId });
+          if (stageRes2 && Array.isArray(stageRes2)) stages = stageRes2;
+        }
+        if (stages.length === 0) {
+          const curStageId = sessionStorage.getItem('tb21_current_stage_id') || '';
+          if (curStageId) stages.push({ stageId: curStageId });
+        }
+
         const resList = [];
-        for (let i = 0; i < stages.length; i++) {
+        for (let i = 0; i < (stages.length || 1); i++) {
           const sId = stages[i] ? stages[i].stageId : '';
+          if (!sId) continue;
           const [mustRes, eleRes] = await Promise.all([
             get('/nms/html/courseStudy/getCourseDetailByProjectId.do', {
-              projectId: projectId,
               stageId: sId,
               courseType: 'MUST',
               courseStatus: 'NOT_COMPLETE',
@@ -1003,7 +1055,6 @@
               pageSize: 100
             }).catch(function () { return null; }),
             get('/nms/html/courseStudy/getCourseDetailByProjectId.do', {
-              projectId: projectId,
               stageId: sId,
               courseType: 'SELECTIVE',
               courseStatus: 'NOT_COMPLETE',
@@ -1031,22 +1082,24 @@
         if (resList.length > 0) return resList;
 
         // 备用降级: loadCoursePage.do
-        const pageRes = await loadAllCourses(projectId, '', '');
-        if (pageRes && pageRes.rows && Array.isArray(pageRes.rows)) {
-          pageRes.rows.forEach(function (r) {
-            const cid = String(r.courseId || (r.courseInfo && r.courseInfo.courseId) || '');
-            const text = r.courseSchedule || r.currentStepRate || '';
-            const isDone = String(text).indexOf('100') > -1 || r.status === 2;
-            if (cid && !isDone && !resList.some(function (x) { return x.courseId === cid; })) {
-              resList.push({
-                courseId: cid,
-                title: r.courseName || r.courseTitle || (r.courseInfo && r.courseInfo.courseTitle) || ('课程_' + cid),
-                score: r.score || r.courseScore || 0,
-                sourceId: '',
-                providerCorpCode: ''
-              });
-            }
-          });
+        if (pId) {
+          const pageRes = await loadAllCourses(pId, '', '');
+          if (pageRes && pageRes.rows && Array.isArray(pageRes.rows)) {
+            pageRes.rows.forEach(function (r) {
+              const cid = String(r.courseId || (r.courseInfo && r.courseInfo.courseId) || '');
+              const text = r.courseSchedule || r.currentStepRate || '';
+              const isDone = String(text).indexOf('100') > -1 || r.status === 2;
+              if (cid && !isDone && !resList.some(function (x) { return x.courseId === cid; })) {
+                resList.push({
+                  courseId: cid,
+                  title: r.courseName || r.courseTitle || (r.courseInfo && r.courseInfo.courseTitle) || ('课程_' + cid),
+                  score: r.score || r.courseScore || 0,
+                  sourceId: '',
+                  providerCorpCode: ''
+                });
+              }
+            });
+          }
         }
         return resList;
       } catch (err) {
@@ -1866,7 +1919,7 @@
     if (!isFleetActive) {
       cardsHtml = '<div class="ap-fleet-empty">静默舰队未启动（勾选开启0%CPU多课并发）</div>';
     } else if (workers.length === 0) {
-      cardsHtml = '<div class="ap-fleet-empty">' + (qCount > 0 ? ('正在调度队列中 ' + qCount + ' 门课程...') : '队列暂无待刷课程') + '</div>';
+      cardsHtml = '<div class="ap-fleet-empty">' + (qCount > 0 ? ('正在调度队列中 ' + qCount + ' 门课程...') : '队列暂无课程 <button id="tb21-btn-force-scan" style="background:#0284c7;color:#fff;border:none;padding:1px 6px;border-radius:4px;cursor:pointer;margin-left:4px;font-size:10px;">重新扫描</button>') + '</div>';
     } else {
       workers.forEach(function (w) {
         cardsHtml +=
@@ -1907,6 +1960,18 @@
       '</div>' +
       '<div class="ap-fleet-list">' + cardsHtml + '</div>' +
       (isFleetActive ? ('<div style="font-size:10px;color:#64748b;margin-top:4px;display:flex;justify-content:space-between;"><span>已结课: ' + cCount + ' 门</span><span>排队中: ' + qCount + ' 门</span></div>') : '');
+
+    const forceScanBtn = fleetBox.querySelector('#tb21-btn-force-scan');
+    if (forceScanBtn) {
+      forceScanBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        forceScanBtn.textContent = '扫描中...';
+        if (!HeadlessFleetManager.isFleetRunning()) HeadlessFleetManager.start();
+        scanAndDispatchFleet().then(function() {
+          renderFleetDashboard();
+        });
+      });
+    }
 
     const toggle = fleetBox.querySelector('#tb21-headless-toggle');
     if (toggle) {
