@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.12.1
+// @version      1.12.2
 // @description  在线课程学习辅助（21tb / 重庆公需课）：倍速播放（2x~16x）、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -1651,6 +1651,7 @@
 
           apiRequirementData = {
             totalRequired: mustScore + eleScore,
+            totalRequirement: mustScore + eleScore,
             totalEarned: doneMust + doneEle,
             requiredMin: mustScore,
             electiveMin: eleScore,
@@ -1823,6 +1824,10 @@
       if (data.remainingElective === null && data.electiveMin !== null && data.earnedElective !== null) {
         data.remainingElective = Math.max(0, data.electiveMin - data.earnedElective);
       }
+      if ((data.totalRequirement === null || data.totalRequirement === undefined) && (data.requiredMin !== null || data.electiveMin !== null)) {
+        data.totalRequirement = (data.requiredMin || 0) + (data.electiveMin || 0);
+      }
+      data.totalRequired = data.totalRequirement;
 
       const hasData = Object.keys(data).some(function (key) {
         return key === 'title' ? !!data[key] : (key !== 'routeKey' && data[key] !== null);
@@ -2021,11 +2026,14 @@
       try {
         const c = countCourses();
         const activeTab = document.querySelector('.el-tabs__item.is-active');
+        const params = getRouteQueryParams();
         localStorage.setItem('tb21_category_progress', JSON.stringify({
           required: c.required,
           elective: c.elective,
           credit: readCategoryRequirement(),
           activeTab: activeTab ? activeTab.textContent.trim() : '',
+          projectId: params.projectId || '',
+          roadMapId: params.roadMapId || '',
           ts: Date.now()
         }));
       } catch (e) {}
@@ -3222,32 +3230,188 @@
         if (ptxt.textContent !== t) ptxt.textContent = t;
       }
 
-      // 类目进度（从 localStorage 读取，由详情页写入）
+      // 类目进度（从 localStorage 读取，由详情页写入，支持自适应直连拉取补齐与现代拟态看板）
       const catInfo = panel.querySelector('.th-cat-info');
       if (catInfo) {
         try {
-          const cat = JSON.parse(localStorage.getItem('tb21_category_progress') || 'null');
-          if (cat && Date.now() - cat.ts < 3600000) {
-            const totalAll = cat.required.total + cat.elective.total;
-            const doneAll = cat.required.done + cat.elective.done;
+          let cat = JSON.parse(localStorage.getItem('tb21_category_progress') || 'null');
+
+          // 如果没有缓存或缺少学分数据，尝试从当前页面 URL / 上下文异步拉取补全（避免外部直达播放页时无数据）
+          if ((!cat || !cat.credit) && !panel._isFetchingCat) {
+            panel._isFetchingCat = true;
+            (async function () {
+              try {
+                const q = getRouteQueryParams();
+                const rmId = q.roadMapId || (cat && cat.roadMapId) || '';
+                const pId = q.projectId || (cat && cat.projectId) || '';
+                if (rmId || pId) {
+                  const [stageList, projectDetail] = await Promise.all([
+                    rmId ? TbApiClient.getStageRequirements(rmId) : Promise.resolve(null),
+                    pId ? TbApiClient.getProjectDetail(pId) : Promise.resolve(null)
+                  ]);
+                  if (stageList && stageList.length) {
+                    let mustScore = 0, eleScore = 0;
+                    stageList.forEach(function (s) {
+                      mustScore += Number(s.mustTotalScore || 0);
+                      eleScore += Number(s.electiveTotalScore || 0);
+                    });
+                    const doneMust = projectDetail ? Number(projectDetail.complateMustScore || 0) : 0;
+                    const doneEle = projectDetail ? Number(projectDetail.complateElectiveScore || 0) : 0;
+                    const creditObj = {
+                      totalRequired: mustScore + eleScore,
+                      totalRequirement: mustScore + eleScore,
+                      requiredMin: mustScore,
+                      electiveMin: eleScore,
+                      earnedRequired: doneMust,
+                      earnedElective: doneEle,
+                      remainingRequired: Math.max(0, mustScore - doneMust),
+                      remainingElective: Math.max(0, eleScore - doneEle),
+                      title: (projectDetail && (projectDetail.projectName || projectDetail.rmProjectName)) || '',
+                      isOfficialApi: true,
+                      ts: Date.now()
+                    };
+                    const existing = JSON.parse(localStorage.getItem('tb21_category_progress') || '{}');
+                    existing.credit = creditObj;
+                    existing.projectId = pId;
+                    existing.roadMapId = rmId;
+                    if (!existing.required) existing.required = { total: 0, done: 0, unfinished: 0 };
+                    if (!existing.elective) existing.elective = { total: 0, done: 0, unfinished: 0 };
+                    existing.ts = Date.now();
+                    localStorage.setItem('tb21_category_progress', JSON.stringify(existing));
+                  }
+                }
+              } catch (err) {
+              } finally {
+                setTimeout(function () { panel._isFetchingCat = false; }, 10000);
+              }
+            })();
+          }
+
+          // 缓存有效期放宽至 7 天，长时间挂机或隔天刷课绝不清空数据！
+          if (cat && Date.now() - cat.ts < 7 * 86400000) {
+            const req = cat.required || { total: 0, done: 0, unfinished: 0 };
+            const ele = cat.elective || { total: 0, done: 0, unfinished: 0 };
+            const totalAll = (req.total || 0) + (ele.total || 0);
+            const doneAll = (req.done || 0) + (ele.done || 0);
             const pctAll = totalAll > 0 ? Math.round(doneAll / totalAll * 100) : 0;
-            const credit = cat.credit;
-            const creditText = credit
-              ? ((credit.title ? credit.title + '\n' : '') +
-                 '学分要求：总计 ' + (credit.totalRequirement === null ? '--' : credit.totalRequirement) +
-                 '（必修≥' + (credit.requiredMin === null ? '--' : credit.requiredMin) +
-                 '，选修≥' + (credit.electiveMin === null ? '--' : credit.electiveMin) + '）\n' +
-                 '仍需：必修 ' + (credit.remainingRequired === null ? '--' : credit.remainingRequired) +
-                 '，选修 ' + (credit.remainingElective === null ? '--' : credit.remainingElective) + ' 学分\n')
-              : '';
-            const catText = creditText +
-              '当前列表：' + doneAll + '/' + totalAll + '（' + pctAll + '%）\n' +
-              '必修课：' + cat.required.done + '/' + cat.required.total + ' 完成，剩 ' + cat.required.unfinished + ' 门\n' +
-              '选修课：' + cat.elective.done + '/' + cat.elective.total + ' 完成，剩 ' + cat.elective.unfinished + ' 门';
-            if (catInfo.textContent !== catText) catInfo.textContent = catText;
+            const credit = cat.credit || null;
+
+            let reqCardHtml = '';
+            let eleCardHtml = '';
+            let hasCredit = false;
+            let allPassed = false;
+
+            if (credit) {
+              hasCredit = true;
+              const reqMin = (credit.requiredMin != null && !isNaN(credit.requiredMin)) ? Number(credit.requiredMin) : null;
+              const eleMin = (credit.electiveMin != null && !isNaN(credit.electiveMin)) ? Number(credit.electiveMin) : null;
+              const remReq = (credit.remainingRequired != null && !isNaN(credit.remainingRequired)) ? Number(credit.remainingRequired) : (reqMin != null ? reqMin : null);
+              const remEle = (credit.remainingElective != null && !isNaN(credit.remainingElective)) ? Number(credit.remainingElective) : (eleMin != null ? eleMin : null);
+              const earnedReq = (credit.earnedRequired != null && !isNaN(credit.earnedRequired)) ? Number(credit.earnedRequired) : ((reqMin != null && remReq != null) ? Math.max(0, reqMin - remReq) : '--');
+              const earnedEle = (credit.earnedElective != null && !isNaN(credit.earnedElective)) ? Number(credit.earnedElective) : ((eleMin != null && remEle != null) ? Math.max(0, eleMin - remEle) : '--');
+
+              const isReqOk = remReq !== null && remReq <= 0;
+              const isEleOk = remEle !== null && remEle <= 0;
+              allPassed = isReqOk && isEleOk;
+
+              // 必修卡片：未达标显醒目发光金黄色，达标显清爽翡翠绿
+              if (reqMin !== null) {
+                if (isReqOk) {
+                  reqCardHtml =
+                    '<div class="th-card ok">' +
+                      '<div class="th-card-title">📘 必修学分</div>' +
+                      '<div class="th-card-val">✓ 已达标</div>' +
+                      '<div class="th-card-sub">已修 ' + earnedReq + '/' + reqMin + ' 分</div>' +
+                    '</div>';
+                } else {
+                  reqCardHtml =
+                    '<div class="th-card need">' +
+                      '<div class="th-card-title">📘 必修学分</div>' +
+                      '<div class="th-card-val">还需 ' + (remReq != null ? remReq : '--') + ' 分</div>' +
+                      '<div class="th-card-sub">目标 ≥ ' + reqMin + ' (已修 ' + earnedReq + ')</div>' +
+                    '</div>';
+                }
+              }
+
+              // 选修卡片：未达标显醒目发光金黄色，达标显清爽翡翠绿
+              if (eleMin !== null) {
+                if (isEleOk) {
+                  eleCardHtml =
+                    '<div class="th-card ok">' +
+                      '<div class="th-card-title">📙 选修学分</div>' +
+                      '<div class="th-card-val">✓ 已达标</div>' +
+                      '<div class="th-card-sub">目标 ≥ ' + eleMin + ' (已修 ' + earnedEle + ')</div>' +
+                    '</div>';
+                } else {
+                  eleCardHtml =
+                    '<div class="th-card need">' +
+                      '<div class="th-card-title">📙 选修学分</div>' +
+                      '<div class="th-card-val">还需 ' + (remEle != null ? remEle : '--') + ' 分</div>' +
+                      '<div class="th-card-sub">目标 ≥ ' + eleMin + ' (已修 ' + earnedEle + ')</div>' +
+                    '</div>';
+                }
+              }
+            }
+
+            // 状态徽章（右上角）
+            let statusTag = '';
+            if (hasCredit) {
+              if (allPassed) {
+                statusTag = '<span class="th-cat-tag ok">全部达标 🎉</span>';
+              } else {
+                statusTag = '<span class="th-cat-tag warn">学分攻坚中</span>';
+              }
+            } else if (totalAll > 0) {
+              statusTag = '<span class="th-cat-tag ok">' + pctAll + '%</span>';
+            }
+
+            // 数据签名比对，仅在数据变化时重绘（杜绝 DOM 闪烁）
+            const sig = JSON.stringify([req, ele, credit, totalAll, doneAll, pctAll]);
+            if (catInfo._lastSig !== sig) {
+              catInfo._lastSig = sig;
+              let html = '<div class="th-cat-box">';
+
+              // 1. 顶部状态/项目名称行
+              const projTitle = (credit && credit.title) ? credit.title : (cat.activeTab ? cat.activeTab : '');
+              html +=
+                '<div class="th-cat-meta">' +
+                  '<span class="th-cat-name" title="' + String(projTitle).replace(/"/g, '&quot;') + '">' + (projTitle ? (projTitle.length > 14 ? projTitle.slice(0, 13) + '…' : projTitle) : '类目学分与门数') + '</span>' +
+                  statusTag +
+                '</div>';
+
+              // 2. 核心达标卡片网格
+              if (reqCardHtml || eleCardHtml) {
+                html += '<div class="th-cat-grid">' + reqCardHtml + eleCardHtml + '</div>';
+              }
+
+              // 3. 课程通关进度条与门数 Pill 标签
+              if (totalAll > 0) {
+                html +=
+                  '<div class="th-cat-bar-wrap">' +
+                    '<div class="th-cat-bar-meta"><span>课程通过进度</span><b>' + doneAll + '/' + totalAll + ' 门 (' + pctAll + '%)</b></div>' +
+                    '<div class="th-cat-bar"><div class="th-cat-bar-fill" style="width:' + pctAll + '%"></div></div>' +
+                  '</div>' +
+                  '<div class="th-cat-pills">' +
+                    '<div class="th-pill"><span>必修</span><b>' + req.done + '/' + req.total + ' 门 (剩' + req.unfinished + ')</b></div>' +
+                    '<div class="th-pill"><span>选修</span><b>' + ele.done + '/' + ele.total + ' 门 (剩' + ele.unfinished + ')</b></div>' +
+                  '</div>';
+              }
+
+              html += '</div>';
+              catInfo.innerHTML = html;
+            }
           } else {
-            const hint = '打开课程详情页后自动显示类目进度';
-            if (catInfo.textContent !== hint) catInfo.textContent = hint;
+            // 空状态：优雅引导卡片
+            const emptySig = 'EMPTY_HINT';
+            if (catInfo._lastSig !== emptySig) {
+              catInfo._lastSig = emptySig;
+              catInfo.innerHTML =
+                '<div class="th-cat-empty">' +
+                  '<div class="th-cat-empty-icon">📡</div>' +
+                  '<div class="th-cat-empty-txt">暂未同步大类目学分</div>' +
+                  '<div class="th-cat-empty-sub">打开大类目或课程详情页后自动同步</div>' +
+                '</div>';
+            }
           }
         } catch (e) {}
       }
@@ -3530,8 +3694,35 @@
         #tb21-panel .th-prog-fill{height:100%;width:0;background:linear-gradient(90deg,#10b981,#06b6d4,#3b82f6);border-radius:4px;
           transition:width .5s ease-out;box-shadow:0 0 8px rgba(6,182,212,.4)}
         #tb21-panel .th-prog-txt{color:#94a3b8;font-size:11px;margin-top:3px}
-        #tb21-panel .th-cat-title,#tb21-panel .th-dash-title{font-weight:700;margin-top:9px;padding-top:7px;border-top:1px solid rgba(255,255,255,.08);font-size:12px;color:#e2e8f0}
-        #tb21-panel .th-cat-info{color:#94a3b8;font-size:11px;margin-top:4px;line-height:1.6;white-space:pre-line;background:rgba(255,255,255,.03);padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.04)}
+        #tb21-panel .th-cat-title,#tb21-panel .th-dash-title{font-weight:700;margin-top:9px;padding-top:7px;border-top:1px solid rgba(255,255,255,.08);font-size:12px;color:#e2e8f0;display:flex;align-items:center;justify-content:space-between}
+        #tb21-panel .th-cat-info{margin-top:5px;background:rgba(255,255,255,.03);padding:8px 9px;border-radius:8px;border:1px solid rgba(255,255,255,.06)}
+        #tb21-panel .th-cat-box{display:flex;flex-direction:column;gap:6px}
+        #tb21-panel .th-cat-meta{display:flex;justify-content:space-between;align-items:center;font-size:11px}
+        #tb21-panel .th-cat-name{font-weight:600;color:#cbd5e1;max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        #tb21-panel .th-cat-tag{display:inline-flex;align-items:center;padding:1px 6px;border-radius:10px;font-size:10px;font-weight:600;letter-spacing:0.2px}
+        #tb21-panel .th-cat-tag.ok{background:rgba(16,185,129,.2);color:#34d399;border:1px solid rgba(16,185,129,.35)}
+        #tb21-panel .th-cat-tag.warn{background:rgba(245,158,11,.18);color:#fbbf24;border:1px solid rgba(245,158,11,.35)}
+        #tb21-panel .th-cat-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+        #tb21-panel .th-card{padding:6px 8px;border-radius:6px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);display:flex;flex-direction:column;gap:1px}
+        #tb21-panel .th-card.need{background:linear-gradient(135deg,rgba(245,158,11,.14),rgba(217,119,6,.06));border-color:rgba(245,158,11,.45);box-shadow:0 0 10px rgba(245,158,11,.12)}
+        #tb21-panel .th-card.ok{background:linear-gradient(135deg,rgba(16,185,129,.14),rgba(5,150,105,.06));border-color:rgba(16,185,129,.4)}
+        #tb21-panel .th-card-title{font-size:10px;color:#94a3b8;font-weight:500}
+        #tb21-panel .th-card-val{font-size:13px;font-weight:700;line-height:1.2;margin:1px 0}
+        #tb21-panel .th-card.need .th-card-val{color:#fbbf24;text-shadow:0 0 8px rgba(245,158,11,.3)}
+        #tb21-panel .th-card.ok .th-card-val{color:#34d399;text-shadow:0 0 8px rgba(52,211,153,.3)}
+        #tb21-panel .th-card-sub{font-size:10px;color:#94a3b8;line-height:1.2}
+        #tb21-panel .th-cat-bar-wrap{margin-top:2px}
+        #tb21-panel .th-cat-bar-meta{font-size:10px;color:#94a3b8;display:flex;justify-content:space-between;margin-bottom:3px}
+        #tb21-panel .th-cat-bar-meta b{color:#f1f5f9;font-weight:600}
+        #tb21-panel .th-cat-bar{height:5px;background:rgba(255,255,255,.08);border-radius:3px;overflow:hidden}
+        #tb21-panel .th-cat-bar-fill{height:100%;background:linear-gradient(90deg,#0ea5e9,#10b981);border-radius:3px;transition:width .4s ease-out}
+        #tb21-panel .th-cat-pills{display:flex;gap:6px;margin-top:2px}
+        #tb21-panel .th-pill{flex:1;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.06);padding:3px 6px;border-radius:4px;font-size:10px;color:#94a3b8;display:flex;justify-content:space-between;align-items:center}
+        #tb21-panel .th-pill b{color:#e2e8f0;font-weight:600}
+        #tb21-panel .th-cat-empty{padding:10px 4px;text-align:center;color:#94a3b8}
+        #tb21-panel .th-cat-empty-icon{font-size:16px;margin-bottom:2px}
+        #tb21-panel .th-cat-empty-txt{font-size:11px;font-weight:600;color:#cbd5e1}
+        #tb21-panel .th-cat-empty-sub{font-size:10px;color:#64748b;margin-top:2px}
         #tb21-panel .th-dash-list{max-height:172px;overflow-y:auto;margin-top:5px;padding-right:2px}
         #tb21-panel .dh-row{padding:6px 8px;border-radius:8px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.05);cursor:pointer;margin-bottom:5px;transition:all .2s}
         #tb21-panel .dh-row:hover{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.12);transform:translateY(-1px)}
