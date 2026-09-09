@@ -27,6 +27,13 @@ const newVersion = `${major}.${minor}.${patch}`;
 code = code.replace(versionMatch[0], `${prefix}${newVersion}`);
 fs.writeFileSync(SCRIPT_FILE, code, 'utf8');
 
+// 同步更新 README.md 中的版本号徽章
+if (fs.existsSync('README.md')) {
+  let readme = fs.readFileSync('README.md', 'utf8');
+  readme = readme.replace(/badge\/version-[0-9.]+-blue/g, `badge/version-${newVersion}-blue`);
+  fs.writeFileSync('README.md', readme, 'utf8');
+}
+
 console.log(`\n📦 版本号已自动升级: ${versionMatch[2]}.${versionMatch[3]}.${versionMatch[4]} ➔ ${newVersion}`);
 
 try {
