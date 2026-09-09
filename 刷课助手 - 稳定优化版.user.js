@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.12.3
+// @version      1.12.4
 // @description  在线课程学习辅助（21tb / 重庆公需课）：倍速播放（2x~16x）、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -356,7 +356,8 @@
   let S = {
     speed: storeGet('speed', 8),       // 目标倍速 2 / 4 / 8 / 16
     autoNext: storeGet('autoNext', true),
-    autoMute: storeGet('autoMute', true)
+    autoMute: storeGet('autoMute', true),
+    rushMode: storeGet('rushMode', false) // 🚀 极速冲刺秒刷模式（15~20秒通关/节）
   };
 
   const SPEEDS = [2, 4, 8, 16];
@@ -365,6 +366,7 @@
     storeSet('speed', S.speed);
     storeSet('autoNext', S.autoNext);
     storeSet('autoMute', S.autoMute);
+    storeSet('rushMode', S.rushMode);
   }
 
   /* ============ 公共：会话 cookie 修复 ============ */
@@ -3105,8 +3107,8 @@
         userPaused = false; // 新视频重置手动暂停标志，允许自动恢复
         isWaitingNext = false; // 新视频解除切节锁定
         isWaitingNextTime = 0;
-        softStartUntil = Date.now() + 8000; // 缓启动 8 秒（1x 原速度）
-        newVideoProtectUntil = Date.now() + 20000; // 新视频保护期 20 秒（不触发主动切节）
+        softStartUntil = Date.now() + (S.rushMode ? 2500 : 8000); // 冲刺模式仅握手2.5秒，稳健模式缓启动8秒
+        newVideoProtectUntil = Date.now() + (S.rushMode ? 4000 : 20000); // 冲刺模式缩短新视频保护期
         nearEndHandled = false; // 新视频重置接近结尾标志
         console.log('[刷课助手] 检测到视频切换，1x播8秒 → 渐进提速到', S.speed + 'x');
 
@@ -3471,7 +3473,12 @@
       const st = panel.querySelector('.th-status');
       if (st) {
         const v = getVideo();
-        let txt = S.speed + 'x' + ' · ' + (S.autoMute ? '静音' : '有声') + ' · ' + (S.autoNext ? '自动' : '手动');
+        let txt = '';
+        if (S.rushMode) {
+          txt = '🚀 极速冲刺中 · ' + (S.autoMute ? '静音' : '有声') + ' · ' + (S.autoNext ? '自动' : '手动');
+        } else {
+          txt = S.speed + 'x' + ' · ' + (S.autoMute ? '静音' : '有声') + ' · ' + (S.autoNext ? '自动' : '手动');
+        }
         if (quizOpen) txt += ' · ⚠答题验证';
         else if (userPaused) txt += ' · 已暂停(手动)';
         else if (Date.now() < softStartUntil) txt += ' · 1x缓冲';
@@ -3507,6 +3514,97 @@
       }
     }
 
+    /* ---------- 🚀 智能步进脉冲冲刺引擎（Smart Step-Seek Rush） ---------- */
+    let rushTimer = null;
+    let rushStepCount = 0;
+    let rushCurrentVideo = null;
+    let rushHandshakeDone = false;
+
+    function resetRushState() {
+      if (rushTimer) {
+        clearInterval(rushTimer);
+        rushTimer = null;
+      }
+      rushStepCount = 0;
+      rushCurrentVideo = null;
+      rushHandshakeDone = false;
+    }
+
+    function triggerStudyLogReport(v) {
+      if (!v) return;
+      try {
+        v.dispatchEvent(new Event('timeupdate'));
+        v.dispatchEvent(new Event('seeked'));
+      } catch (e) {}
+    }
+
+    function tickRushEngine(v) {
+      if (!S.rushMode || !v || v.ended || isQuizOpen() || isHangUpOpen()) {
+        resetRushState();
+        return;
+      }
+      if (v.readyState < 2 || !v.duration || v.duration <= 0 || isNaN(v.duration)) {
+        return;
+      }
+
+      if (rushCurrentVideo !== v) {
+        resetRushState();
+        rushCurrentVideo = v;
+      }
+
+      // 阶段 1：首帧合法握手期（前 2.5 秒正常播放建立合规心跳）
+      if (!rushHandshakeDone) {
+        if (v.currentTime < 2.5 && !v.paused) {
+          return;
+        }
+        rushHandshakeDone = true;
+        console.log('[刷课助手] 🚀 极速冲刺启动：初始时序握手完成，开始执行脉冲步进打点...');
+      }
+
+      // 阶段 2：脉冲步进跳跃
+      if (!rushTimer) {
+        rushTimer = setInterval(function () {
+          if (!S.rushMode || !v || v.ended || isQuizOpen() || isHangUpOpen()) {
+            resetRushState();
+            return;
+          }
+
+          if (v.paused) {
+            try { v.play(); } catch (e) {}
+          }
+
+          const dur = v.duration;
+          const cur = v.currentTime;
+          // 全视频分为 6 个脉冲区间，步长约 16.5%
+          const step = Math.max(12, dur * 0.165);
+          const nextTime = cur + step;
+
+          if (nextTime < dur - 2.5) {
+            v.currentTime = nextTime;
+            triggerStudyLogReport(v);
+            rushStepCount++;
+            const pct = Math.round((nextTime / dur) * 100);
+            console.log('[刷课助手] 🚀 极速冲刺脉冲 #' + rushStepCount + ': 推进至 ' + nextTime.toFixed(1) + 's / ' + dur.toFixed(1) + 's (' + pct + '%)');
+          } else {
+            // 阶段 3：尾帧收官完播
+            clearInterval(rushTimer);
+            rushTimer = null;
+            const finishTime = Math.max(0, dur - 0.3);
+            v.currentTime = finishTime;
+            triggerStudyLogReport(v);
+            console.log('[刷课助手] 🚀 极速冲刺尾帧打点完成，触发自然完播！');
+            setTimeout(function () {
+              try {
+                if (v && !v.ended) {
+                  v.dispatchEvent(new Event('ended'));
+                }
+              } catch (e) {}
+            }, 500);
+          }
+        }, 2200); // 每 2.2 秒脉冲推进一次，15~18 秒通关
+      }
+    }
+
     /* ---------- 答题验证提醒 ---------- */
     function notifyQuiz() {
       // 标题闪烁
@@ -3539,6 +3637,13 @@
       getTrackedActiveSection();
       bindVideo(v);
       if (v) applySettings(v);
+
+      // 🚀 极速冲刺脉冲引擎调度
+      if (S.rushMode && v) {
+        tickRushEngine(v);
+      } else if (rushTimer) {
+        resetRushState();
+      }
 
       // 后台保活：视频正在播放时启动静音音频，防止 Chrome 节流后台标签页
       // （视频播放说明用户已经交互，可以启动音频了）
@@ -3713,15 +3818,17 @@
           box-shadow:0 2px 8px rgba(14,165,233,.45)}
         #tb21-panel .th-spd.warn{color:#f59e0b}
         #tb21-panel .th-spd-eta{font-size:10px;color:#94a3b8;line-height:1;font-family:monospace;white-space:nowrap}
-        #tb21-panel .th-switch-row{display:flex;gap:16px;margin:8px 0 6px}
-        #tb21-panel .th-switch-label{display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:11px;color:#cbd5e1;user-select:none}
+        #tb21-panel .th-switch-row{display:flex;gap:10px;margin:8px 0 6px;flex-wrap:wrap}
+        #tb21-panel .th-switch-label{display:inline-flex;align-items:center;gap:5px;cursor:pointer;font-size:11px;color:#cbd5e1;user-select:none}
         #tb21-panel .th-switch-label input[type="checkbox"]{position:absolute;opacity:0;width:0;height:0;pointer-events:none}
-        #tb21-panel .th-switch-track{position:relative;display:inline-block;width:28px;height:16px;background:rgba(255,255,255,.16);
-          border-radius:9px;transition:background .25s cubic-bezier(.4,0,.2,1)}
-        #tb21-panel .th-switch-thumb{position:absolute;top:2px;left:2px;width:12px;height:12px;background:#fff;border-radius:50%;
+        #tb21-panel .th-switch-track{position:relative;display:inline-block;width:26px;height:15px;background:rgba(255,255,255,.16);
+          border-radius:8px;transition:background .25s cubic-bezier(.4,0,.2,1)}
+        #tb21-panel .th-switch-thumb{position:absolute;top:1.5px;left:2px;width:12px;height:12px;background:#fff;border-radius:50%;
           box-shadow:0 1px 3px rgba(0,0,0,.35);transition:transform .25s cubic-bezier(.4,0,.2,1)}
         #tb21-panel .th-switch-label input[type="checkbox"]:checked + .th-switch-track{background:#10b981;box-shadow:0 0 8px rgba(16,185,129,.4)}
-        #tb21-panel .th-switch-label input[type="checkbox"]:checked + .th-switch-track .th-switch-thumb{transform:translateX(12px)}
+        #tb21-panel .th-switch-label input[type="checkbox"]:checked + .th-switch-track .th-switch-thumb{transform:translateX(11px)}
+        #tb21-panel .th-switch-label.rush input[type="checkbox"]:checked + .th-switch-track{background:linear-gradient(135deg,#f59e0b,#ec4899);box-shadow:0 0 10px rgba(245,158,11,.6)}
+        #tb21-panel .th-switch-label.rush .th-switch-txt{color:#fbbf24;font-weight:700}
         #tb21-panel .th-prog{margin:8px 0 4px}
         #tb21-panel .th-prog-bar{height:7px;background:rgba(255,255,255,.08);border-radius:4px;overflow:hidden;box-shadow:inset 0 1px 2px rgba(0,0,0,.3)}
         #tb21-panel .th-prog-fill{height:100%;width:0;background:linear-gradient(90deg,#10b981,#06b6d4,#3b82f6);border-radius:4px;
@@ -3788,6 +3895,7 @@
           '<div class="th-row th-switch-row">' +
             '<label class="th-switch-label"><input type="checkbox" id="tb21-autoNext"><span class="th-switch-track"><span class="th-switch-thumb"></span></span><span class="th-switch-txt">自动下一节</span></label>' +
             '<label class="th-switch-label"><input type="checkbox" id="tb21-autoMute"><span class="th-switch-track"><span class="th-switch-thumb"></span></span><span class="th-switch-txt">自动静音</span></label>' +
+            '<label class="th-switch-label rush" title="开启后每2秒向前智能步进推进，15~20秒完成一节课"><input type="checkbox" id="tb21-rushMode"><span class="th-switch-track"><span class="th-switch-thumb"></span></span><span class="th-switch-txt">🚀极速冲刺</span></label>' +
           '</div>' +
           '<div class="th-prog"><div class="th-prog-bar"><div class="th-prog-fill"></div></div><div class="th-prog-txt">当前课进度 --</div></div>' +
           '<div class="th-cat-title">📊 类目进度</div>' +
@@ -3877,6 +3985,16 @@
           applySettings(v);
         }
       });
+      const ckR = panel.querySelector('#tb21-rushMode');
+      if (ckR) {
+        ckR.checked = !!S.rushMode;
+        ckR.addEventListener('change', function () {
+          S.rushMode = ckR.checked;
+          save();
+          console.log('[刷课助手] 🚀 极速冲刺模式已' + (S.rushMode ? '开启（15~20秒通关/节）' : '关闭（恢复稳健倍速）'));
+          if (!S.rushMode) resetRushState();
+        });
+      }
 
       // 恢复上次拖动位置（越界时收进视口）
       try {
