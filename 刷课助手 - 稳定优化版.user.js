@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.13.0
-// @description  在线课程学习辅助（21tb / 重庆公需课）：倍速播放（2x~16x）、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
+// @version      1.14.0
+// @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
 // @downloadURL  https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -252,12 +252,48 @@
                     }
                   }
 
-                  // 核心破解：允许高倍速、允许拖拽、关闭反作弊、清空最低学习时间
+                  // 核心破解：允许高倍速、允许拖拽、关闭反作弊、清空最低学习时间，并智能缓存课程章节与时长元数据
                   if (this._url.indexOf('showCourseSettingConfig') > -1 ||
                       this._url.indexOf('showCourseChapter') > -1 ||
                       this._url.indexOf('loadCourseSystemSetting') > -1) {
                     try {
                       let text = modifiedResponse || currentResponseText;
+                      // 自动采集课程时长与章节元数据到缓存池
+                      if (this._url.indexOf('showCourseChapter') > -1) {
+                        try {
+                          const chapJson = JSON.parse(text);
+                          if (chapJson && chapJson.bizResult && Array.isArray(chapJson.bizResult)) {
+                            let totSec = 0, totDur = 0, unfSec = 0, unfDur = 0, courseIdFound = '';
+                            chapJson.bizResult.forEach(function(ch) {
+                              if (ch && Array.isArray(ch.resourceDTOS)) {
+                                ch.resourceDTOS.forEach(function(r) {
+                                  totSec++;
+                                  const d = Number(r.minStudyTime || r.timeToFinish || 0);
+                                  totDur += d;
+                                  if (!r.confirmFinish && !r.finish) { unfSec++; unfDur += d; }
+                                  if (!courseIdFound && r.courseId) courseIdFound = String(r.courseId);
+                                });
+                              }
+                            });
+                            if (!courseIdFound) {
+                              const m = location.href.match(/courseId=([^&#]+)/);
+                              if (m) courseIdFound = m[1];
+                            }
+                            if (courseIdFound) {
+                              const cStore = JSON.parse(localStorage.getItem('tb21_course_meta_cache') || '{}');
+                              cStore[courseIdFound] = Object.assign({}, cStore[courseIdFound] || {}, {
+                                totalSections: totSec,
+                                totalDuration: totDur,
+                                unfinishedSections: unfSec,
+                                unfinishedDuration: unfDur,
+                                ts: Date.now()
+                              });
+                              localStorage.setItem('tb21_course_meta_cache', JSON.stringify(cStore));
+                            }
+                          }
+                        } catch(e) {}
+                      }
+
                       text = text.replace(/"allowHighSpeed":\s*0/g, '"allowHighSpeed":1')
                                  .replace(/"allowDrag":\s*0/g, '"allowDrag":1')
                                  .replace(/"enablePreventCheat":\s*true/g, '"enablePreventCheat":false')
@@ -893,6 +929,43 @@
       });
     }
 
+    // 7. 异步探测课程完整章节树、总时长与待播小节元数据
+    async function fetchCourseChapterMeta(courseId) {
+      if (!courseId) return null;
+      try {
+        let res = await post('/tbc-rms/course/showCourseChapter', { courseId: courseId });
+        if (!res || !res.bizResult) {
+          res = await get('/tbc-rms/course/showCourseChapter', { courseId: courseId });
+        }
+        if (res && res.bizResult && Array.isArray(res.bizResult)) {
+          let totalSections = 0;
+          let totalDuration = 0;
+          let unfinishedSections = 0;
+          let unfinishedDuration = 0;
+          res.bizResult.forEach(function (ch) {
+            if (ch && Array.isArray(ch.resourceDTOS)) {
+              ch.resourceDTOS.forEach(function (r) {
+                totalSections++;
+                const dur = Number(r.minStudyTime || r.timeToFinish || 0);
+                totalDuration += dur;
+                if (!r.confirmFinish && !r.finish) {
+                  unfinishedSections++;
+                  unfinishedDuration += dur;
+                }
+              });
+            }
+          });
+          return {
+            totalSections: totalSections,
+            totalDuration: totalDuration,
+            unfinishedSections: unfinishedSections,
+            unfinishedDuration: unfinishedDuration
+          };
+        }
+      } catch (e) {}
+      return null;
+    }
+
     return {
       get: get,
       post: post,
@@ -901,7 +974,105 @@
       getProjectDetail: getProjectDetail,
       loadAllCourses: loadAllCourses,
       checkExamAvailable: checkExamAvailable,
-      fetchUserCertificates: fetchUserCertificates
+      fetchUserCertificates: fetchUserCertificates,
+      fetchCourseChapterMeta: fetchCourseChapterMeta
+    };
+  })();
+
+  /* ---------- ⚡ 课程元数据与性价比缓存库 (CourseMetaStore) ---------- */
+  const CourseMetaStore = (function () {
+    const STORAGE_KEY = 'tb21_course_meta_cache';
+    let _cache = null;
+
+    function load() {
+      if (_cache) return _cache;
+      try {
+        _cache = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+      } catch (e) {
+        _cache = {};
+      }
+      return _cache;
+    }
+
+    function save() {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(_cache || {}));
+      } catch (e) {}
+    }
+
+    function get(courseId) {
+      if (!courseId) return null;
+      const c = load();
+      return c[courseId] || null;
+    }
+
+    function set(courseId, data) {
+      if (!courseId || !data) return;
+      const c = load();
+      c[courseId] = Object.assign({}, c[courseId] || {}, data, { ts: Date.now() });
+      save();
+    }
+
+    // 计算综合效率指数 (CPI: 学分/分钟产出率 与 章节产出率)
+    function calculateScore(credits, durationSec, sectionCount, isRush) {
+      const cred = Math.max(0.1, Number(credits) || 1.0);
+      const durMin = Math.max(1, Math.round((durationSec || 1800) / 60));
+      const secCount = Math.max(1, Number(sectionCount) || 1);
+      const baseCpi = cred / durMin; // 基础每分钟学分
+
+      if (isRush) {
+        // 极速模式下：1节视频约15~20秒！节数最少的课程拥有巨大速度优势
+        const creditPerSec = cred / secCount;
+        return Math.round((creditPerSec * 0.7 + baseCpi * 0.3) * 1000) / 1000;
+      } else {
+        return Math.round(baseCpi * 1000) / 1000;
+      }
+    }
+
+    // 智能防抖扫描任务队列 (最大并发 3)
+    const pendingQueue = [];
+    let runningWorkers = 0;
+    const MAX_WORKERS = 3;
+
+    function processQueue() {
+      while (runningWorkers < MAX_WORKERS && pendingQueue.length > 0) {
+        const task = pendingQueue.shift();
+        runningWorkers++;
+        TbApiClient.fetchCourseChapterMeta(task.courseId).then(function (meta) {
+          if (meta) {
+            set(task.courseId, {
+              totalSections: meta.totalSections,
+              totalDuration: meta.totalDuration,
+              unfinishedSections: meta.unfinishedSections,
+              unfinishedDuration: meta.unfinishedDuration
+            });
+            if (task.onDone) task.onDone(meta);
+          }
+        }).catch(function () {}).finally(function () {
+          runningWorkers--;
+          processQueue();
+        });
+      }
+    }
+
+    function requestScan(courseId, onDone) {
+      if (!courseId) return;
+      const existing = get(courseId);
+      if (existing && existing.ts && Date.now() - existing.ts < 7 * 24 * 3600 * 1000) {
+        if (onDone) onDone(existing);
+        return;
+      }
+      if (!pendingQueue.some(function (t) { return t.courseId === courseId; })) {
+        pendingQueue.push({ courseId: courseId, onDone: onDone });
+        processQueue();
+      }
+    }
+
+    return {
+      get: get,
+      set: set,
+      calculateScore: calculateScore,
+      requestScan: requestScan
     };
   })();
 
@@ -1087,6 +1258,13 @@
       #tb21-auto-panel .ap-year-list{display:none;padding:3px 0 4px 12px;max-height:180px;overflow-y:auto}
       #tb21-auto-panel .ap-year-group.expanded .ap-year-list{display:block}
       #tb21-auto-panel .ap-year-empty{color:#64748b;font-size:10px;padding:4px 0;font-style:italic}
+      #tb21-auto-panel .ap-strat-bar{display:flex;align-items:center;gap:4px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:6px;padding:3px 6px;margin-bottom:6px}
+      #tb21-auto-panel .ap-strat-title{font-size:10px;color:#94a3b8;font-weight:600;flex-shrink:0}
+      #tb21-auto-panel .ap-strat-btn{flex:1;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);color:#94a3b8;font-size:10px;padding:3px 2px;border-radius:4px;cursor:pointer;transition:all .15s;text-align:center}
+      #tb21-auto-panel .ap-strat-btn:hover{background:rgba(255,255,255,.09);color:#f1f5f9}
+      #tb21-auto-panel .ap-strat-btn.active{background:rgba(14,165,233,.2);border-color:#38bdf8;color:#38bdf8;font-weight:700}
+      #tb21-auto-panel .ap-meta-pill{color:#38bdf8;background:rgba(14,165,233,.12);border-radius:3px;padding:1px 4px;font-size:9px;margin-left:4px;flex-shrink:0}
+      #tb21-auto-panel .ap-cpi-pill{color:#fbbf24;background:rgba(245,158,11,.15);border-radius:3px;padding:1px 4px;font-size:9px;margin-left:4px;flex-shrink:0;font-weight:700}
       #tb21-auto-panel ::-webkit-scrollbar{width:4px}
       #tb21-auto-panel ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.18);border-radius:4px}
     `;
@@ -1868,8 +2046,42 @@
       return result;
     }
 
+    function getCardCourseId(card) {
+      if (!card) return '';
+      try {
+        if (card.__vue__ && card.__vue__.courseInfo && card.__vue__.courseInfo.courseId) {
+          return String(card.__vue__.courseInfo.courseId);
+        }
+      } catch (e) {}
+      const nodes = [card].concat(Array.prototype.slice.call(card.querySelectorAll(
+        '[data-course-id], [data-courseid], [course-id], [courseid], [data-id], a[href]'
+      )));
+      const attrs = ['data-course-id', 'data-courseid', 'course-id', 'courseid', 'data-id'];
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = 0; j < attrs.length; j++) {
+          const val = nodes[i] && nodes[i].getAttribute && nodes[i].getAttribute(attrs[j]);
+          if (val && /^[\w-]{4,}$/.test(val)) return String(val);
+        }
+        const href = nodes[i] && nodes[i].getAttribute && nodes[i].getAttribute('href');
+        if (href) {
+          try {
+            const u = new URL(href, location.href);
+            const val = u.searchParams.get('courseId') || u.searchParams.get('courseid') || u.searchParams.get('id');
+            if (val) return String(val);
+          } catch (e) {}
+        }
+      }
+      return '';
+    }
+
     function getCourseCredits(card) {
       if (!card) return 0;
+      try {
+        if (card.__vue__ && card.__vue__.courseInfo && card.__vue__.courseInfo.courseScore) {
+          const v = parseFloat(card.__vue__.courseInfo.courseScore);
+          if (isFinite(v) && v > 0) return v;
+        }
+      } catch (e) {}
       const info = card.querySelector('.text-info');
       const text = info ? info.textContent : card.textContent;
       const match = String(text || '').match(/([\d.]+)\s*学分/);
@@ -2093,8 +2305,11 @@
       return requirementCache.data;
     }
 
-    // 智能贪心选课规划器：自动计算达标所需的高学分最小课程集合
+    // 智能高性价比选课规划器：按调度策略（极致性价 / 最短用时 / 高分攻坚）自动规划最优课程集合
     function computeOptimalCoursePlan(allCards, requirement) {
+      const currentStrategy = localStorage.getItem('tb21_schedule_strategy') || 'cpi';
+      const isRush = (typeof S !== 'undefined' && S && S.rushMode) ? true : false;
+
       const reqCards = [];
       const eleCards = [];
       allCards.forEach(function (c, idx) {
@@ -2105,25 +2320,97 @@
         const isRequired = txt.indexOf('必修') > -1;
         const credits = getCourseCredits(c);
         const title = getCourseTitle(c);
+        const courseId = getCardCourseId(c);
+
+        // 从 CourseMetaStore 获取或触发异步扫描
+        const meta = CourseMetaStore.get(courseId);
+        if (!meta && courseId && !isDone) {
+          CourseMetaStore.requestScan(courseId, function () {
+            if (typeof refreshCourseList === 'function') refreshCourseList();
+          });
+        }
+
+        const totalDuration = meta ? (meta.totalDuration || 0) : 0;
+        const totalSections = meta ? (meta.totalSections || 0) : 0;
+        const unfinishedDuration = meta ? (meta.unfinishedDuration || 0) : totalDuration;
+        const unfinishedSections = meta ? (meta.unfinishedSections || 0) : totalSections;
+        const durMin = totalDuration > 0 ? Math.max(1, Math.round(totalDuration / 60)) : 0;
+        const unfDurMin = unfinishedDuration > 0 ? Math.max(1, Math.round(unfinishedDuration / 60)) : durMin;
+
+        // 计算 CPI 综合效率
+        const efficiency = CourseMetaStore.calculateScore(
+          credits,
+          unfinishedDuration || totalDuration || 1800,
+          unfinishedSections || totalSections || 1,
+          isRush
+        );
+
+        let cpiShort = '';
+        let cpiLabel = '';
+        if (efficiency >= 0.1) {
+          cpiShort = '极佳';
+          cpiLabel = '极佳 (' + efficiency + '分/m)';
+        } else if (efficiency >= 0.05) {
+          cpiShort = '优';
+          cpiLabel = '良好 (' + efficiency + '分/m)';
+        } else if (efficiency > 0) {
+          cpiShort = '普通';
+          cpiLabel = '一般 (' + efficiency + '分/m)';
+        }
+
         const item = {
           card: c,
           title: title,
           credits: credits,
+          courseId: courseId,
           done: isDone,
           isRequired: isRequired,
-          idx: idx
+          idx: idx,
+          totalDuration: totalDuration,
+          totalSections: totalSections,
+          unfinishedDuration: unfinishedDuration,
+          unfinishedSections: unfinishedSections,
+          durMin: durMin,
+          unfDurMin: unfDurMin,
+          efficiency: efficiency,
+          cpiShort: cpiShort,
+          cpiLabel: cpiLabel
         };
         if (isRequired) reqCards.push(item);
         else eleCards.push(item);
       });
 
-      const sortByCreditDesc = function (a, b) {
+      const sortFn = function (a, b) {
         if (a.done !== b.done) return a.done ? 1 : -1;
-        if (a.credits !== b.credits) return b.credits - a.credits;
-        return a.title.localeCompare(b.title, 'zh');
+        if (currentStrategy === 'shortest') {
+          // ⏱️ 最短耗时优先：待播时长最短 > 待播章节最少 > 学分高 > 标题序
+          const aTime = a.unfinishedDuration || a.totalDuration || 99999;
+          const bTime = b.unfinishedDuration || b.totalDuration || 99999;
+          if (aTime !== bTime) return aTime - bTime;
+          const aSec = a.unfinishedSections || a.totalSections || 999;
+          const bSec = b.unfinishedSections || b.totalSections || 999;
+          if (aSec !== bSec) return aSec - bSec;
+          if (a.credits !== b.credits) return b.credits - a.credits;
+          return a.title.localeCompare(b.title, 'zh');
+        } else if (currentStrategy === 'credits') {
+          // 🎯 传统高分优先：学分降序 > 标题序
+          if (a.credits !== b.credits) return b.credits - a.credits;
+          return a.title.localeCompare(b.title, 'zh');
+        } else {
+          // ⚡ 极致性价比优先（默认）：efficiency 降序 > 学分降序 > 时长升序 > 标题序
+          if (Math.abs(a.efficiency - b.efficiency) > 0.001) {
+            return b.efficiency - a.efficiency;
+          }
+          if (a.credits !== b.credits) return b.credits - a.credits;
+          const aTime = a.unfinishedDuration || a.totalDuration || 99999;
+          const bTime = b.unfinishedDuration || b.totalDuration || 99999;
+          if (aTime !== bTime) return aTime - bTime;
+          return a.title.localeCompare(b.title, 'zh');
+        }
       };
-      reqCards.sort(sortByCreditDesc);
-      eleCards.sort(sortByCreditDesc);
+
+      reqCards.sort(sortFn);
+      eleCards.sort(sortFn);
 
       const needReqCredit = (requirement && requirement.remainingRequired !== null)
         ? Math.max(0, requirement.remainingRequired)
@@ -2236,24 +2523,8 @@
       ? activeCategory.key
       : 'detail:' + normalizeAutoText(location.pathname + location.search + location.hash);
     function getCourseCardKey(card, title, tabName) {
-      const nodes = [card].concat(Array.prototype.slice.call(card.querySelectorAll(
-        '[data-course-id], [data-courseid], [course-id], [courseid], [data-id], a[href]'
-      )));
-      const attrs = ['data-course-id', 'data-courseid', 'course-id', 'courseid', 'data-id'];
-      for (let i = 0; i < nodes.length; i++) {
-        for (let j = 0; j < attrs.length; j++) {
-          const value = nodes[i] && nodes[i].getAttribute && nodes[i].getAttribute(attrs[j]);
-          if (value && /^[\w-]{4,}$/.test(value)) return 'course-id:' + value;
-        }
-        const href = nodes[i] && nodes[i].getAttribute && nodes[i].getAttribute('href');
-        if (href) {
-          try {
-            const url = new URL(href, location.href);
-            const value = url.searchParams.get('courseId') || url.searchParams.get('courseid') || url.searchParams.get('id');
-            if (value) return 'course-id:' + value;
-          } catch (e) {}
-        }
-      }
+      const cid = getCardCourseId(card);
+      if (cid) return 'course-id:' + cid;
       return 'course-title:' + categoryScope + ':' + normalizeAutoText(tabName) + ':' + normalizeAutoText(title);
     }
     function cursorKey(tabName) {
@@ -2313,9 +2584,16 @@
       if (!body || body.querySelector('.ap-courses')) return;
       const coursesDiv = document.createElement('div');
       coursesDiv.className = 'ap-courses';
+      const curStrat = localStorage.getItem('tb21_schedule_strategy') || 'cpi';
       coursesDiv.innerHTML =
+        '<div class="ap-strat-bar">' +
+          '<span class="ap-strat-title">选课:</span>' +
+          '<button class="ap-strat-btn' + (curStrat === 'cpi' ? ' active' : '') + '" data-strat="cpi" title="【极致性价比】学分/分钟比最高优先，耗时最少修满学分">⚡ 极速性价</button>' +
+          '<button class="ap-strat-btn' + (curStrat === 'shortest' ? ' active' : '') + '" data-strat="shortest" title="【最短用时】总时长与章节数最少优先，微课极速秒过">⏱️ 最短用时</button>' +
+          '<button class="ap-strat-btn' + (curStrat === 'credits' ? ' active' : '') + '" data-strat="credits" title="【高分攻坚】单课学分最高优先，经典大课攻坚模式">🎯 高分优先</button>' +
+        '</div>' +
         '<div class="ap-cat-group" data-group="plan">' +
-          '<div class="ap-cat-header"><span class="ap-cat-arrow">▼</span><span class="ap-cat-title">🎯 攻坚计划（精选最少高分课）</span></div>' +
+          '<div class="ap-cat-header"><span class="ap-cat-arrow">▼</span><span class="ap-cat-title">🎯 攻坚计划（精选课程）</span></div>' +
           '<div class="ap-cat-list"></div>' +
         '</div>' +
         '<div class="ap-cat-group collapsed" data-group="skip">' +
@@ -2327,10 +2605,23 @@
           '<div class="ap-cat-list"></div>' +
         '</div>';
       body.appendChild(coursesDiv);
+
+      coursesDiv.querySelectorAll('.ap-strat-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          const strat = btn.dataset.strat;
+          localStorage.setItem('tb21_schedule_strategy', strat);
+          coursesDiv.querySelectorAll('.ap-strat-btn').forEach(function (b) {
+            b.classList.toggle('active', b.dataset.strat === strat);
+          });
+          refreshCourseList();
+        });
+      });
+
       coursesDiv.querySelectorAll('.ap-cat-header').forEach(function (header) {
         header.addEventListener('click', function () { header.closest('.ap-cat-group').classList.toggle('collapsed'); });
       });
     }
+
     function refreshCourseList() {
       const coursesDiv = document.querySelector('#tb21-auto-panel .ap-courses');
       if (!coursesDiv) return;
@@ -2358,16 +2649,21 @@
         }
       });
 
+      const curStrat = localStorage.getItem('tb21_schedule_strategy') || 'cpi';
+      let stratTag = '⚡极佳性价';
+      if (curStrat === 'shortest') stratTag = '⏱️最短用时';
+      else if (curStrat === 'credits') stratTag = '🎯最高学分';
+
       const groupData = {
         plan: {
           items: planItems,
           title: plan.isFullySatisfied
             ? '🎯 攻坚计划（🎉 学分已达成）'
-            : ('🎯 攻坚精选（' + planItems.length + ' 门高分课）')
+            : ('🎯 攻坚精选（' + planItems.length + ' 门 · ' + stratTag + '）')
         },
         skip: {
           items: skipItems,
-          title: '⏭️ 冗余低分（' + skipItems.length + ' 门已跳过）'
+          title: '⏭️ 冗余低效（' + skipItems.length + ' 门已跳过）'
         },
         done: {
           items: doneItems,
@@ -2383,7 +2679,7 @@
         const data = groupData[key];
         titleEl.textContent = data.title;
 
-        const sig = JSON.stringify(data.items.map(function (i) { return [i.title, i.credits, i.done]; }));
+        const sig = JSON.stringify(data.items.map(function (i) { return [i.title, i.credits, i.done, i.totalSections, i.efficiency]; }));
         if (listEl._lastSig === sig) return;
         listEl._lastSig = sig;
 
@@ -2397,10 +2693,20 @@
           const typeTxt = item.isRequired ? '必修' : '选修';
           const extraCls = item.done ? ' done' : (key === 'plan' ? ' is-plan' : (key === 'skip' ? ' is-skip' : ''));
           const icon = item.done ? '✓' : (key === 'plan' ? '🎯' : '○');
-          return '<div class="ap-course-item' + extraCls + '" data-idx="' + item.idx + '" title="' + item.title.replace(/"/g, '&quot;') + '">' +
+
+          let metaHtml = '';
+          if (item.totalSections > 0) {
+            metaHtml += '<span class="ap-meta-pill" title="总计 ' + item.totalSections + ' 节，约 ' + item.durMin + ' 分钟">' + item.totalSections + '节</span>';
+          }
+          if (item.cpiShort) {
+            metaHtml += '<span class="ap-cpi-pill" title="性价比指数：' + item.efficiency + '（' + item.cpiLabel + '）">⚡' + item.cpiShort + '</span>';
+          }
+
+          return '<div class="ap-course-item' + extraCls + '" data-idx="' + item.idx + '" title="' + item.title.replace(/"/g, '&quot;') + (item.cpiLabel ? ' · 性价比：' + item.cpiLabel : '') + '">' +
             '<span class="ap-course-check">' + icon + '</span>' +
             '<span class="' + typeCls + '">' + typeTxt + '</span>' +
             '<span class="ap-course-name">' + item.title + '</span>' +
+            metaHtml +
             (item.credits ? '<span class="ap-credit-pill">' + item.credits + '分</span>' : '') +
           '</div>';
         }).join('');
@@ -2630,14 +2936,14 @@
             title: title,
             key: courseKey,
             credits: planItem.credits,
-            index: planItem.idx
+            index: planItem.idx,
+            planRank: i
           });
         }
 
-        // 按学分降序排序
+        // 严格遵循所选调度策略（极速性价比 / 最短用时 / 高分攻坚）的规划优先级排序！
         candidates.sort(function (a, b) {
-          if (a.credits !== b.credits) return b.credits - a.credits;
-          return a.index - b.index;
+          return a.planRank - b.planRank;
         });
 
         // 翻页处理

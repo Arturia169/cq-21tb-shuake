@@ -1,7 +1,7 @@
 # ⚡ 重庆专技公需课（21tb）全自动刷课助手
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.0-blue.svg?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.14.0-blue.svg?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/platform-Tampermonkey%20%7C%20Violentmonkey-green.svg?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/support-Chrome%20%7C%20Edge%20%7C%20Safari%20%7C%20Firefox-orange.svg?style=flat-square" alt="Browsers">
   <img src="https://img.shields.io/badge/license-MIT-lightgrey.svg?style=flat-square" alt="License">
@@ -9,7 +9,7 @@
 
 一款专为**重庆市专业技术人员继续教育公需科目培训平台（cqrl.21tb.com）**打造的现代化、全自动、黑科技级油猴辅助脚本。
 
-深度逆向融合了官方后端通讯 API 与原生 DOM 兜底机制，实现**“全年度大类目 ➔ 小科目 ➔ 课程 ➔ 章节播放 ➔ 结业考试提醒 ➔ 自动下一大类目”**的真正无人值守全自动大闭环。
+深度逆向融合了官方后端通讯 API 与原生 DOM 兜底机制，实现**“智能高性价比选课 ➔ 小科目 ➔ 课程 ➔ 章节播放 ➔ 结业考试提醒 ➔ 自动下一大类目”**的真正无人值守全自动大闭环。
 
 ---
 
@@ -26,14 +26,22 @@
 
 ## ✨ 核心特性一览
 
-### 1. 📡 官方后端 API 深度直连
+### 1. ⚡ 智能高性价比选课调度引擎（新特性 v1.14.0）
+- **单位时间产出率（CPI）最高优先**：告别“盲目死磕几小时大课”，自动计算 `学分 / 待播时长` 性价比比率，优先精选耗时最短、给分最高的黄金微课；
+- **三档策略自由切换**：
+  - `⚡ 极致性价（默认推荐）`：单位分钟收益最高优先，拿满学分耗时立减 **50%~70%**；
+  - `⏱️ 最短用时`：章节数与总时长最少优先，微课极速秒刷；
+  - `🎯 高分攻坚`：单门课程最高学分优先，经典大课模式；
+- **章节探针与持久化缓存**：毫秒级探测全量课程章节数与真实分钟数，缓存至本地永久加速，越用越聪明。
+
+### 2. 📡 官方后端 API 深度直连
 - **指标零误差直连**：直调官方阶段与项目接口，50ms 内获取官方必修/选修合格线与已完成差额，杜绝页面样式变动导致的正则匹配偏差；
 - **全量课程瞬间秒查**：进入大类目瞬间异步拉取全部课程（`pageSize=100`），免除逐页点击「下一页」的繁琐渲染等待；
 - **24 小时心跳保活**：每 10 分钟自动与服务器交互续签会话（`elnSessionId`），通宵挂机永不掉线；
 - **结业准考自检与直达**：学分修满瞬间异步自检结业考试权限，悬浮窗直推快速通道；
 - **官方证书自查微抽屉**：直连重庆人社备案证书库，实时查看合格年度、发证记录与学时证明。
 
-### 2. 🛡️ 上帝模式与防封护盾
+### 3. 🛡️ 上帝模式与防封护盾
 - **反作弊配置篡改**：在原生 DOM 上下文拦截 `showCourseSettingConfig`，强制解锁高倍速限制、拖拽进度条限制，清空最低学习时间（`minStudyTime=0`）；
 - **进度拉回拦截**：接管底层 `HTMLMediaElement.prototype.currentTime`，拦截平台恶意倒退进度的作弊惩罚；
 - **异常响应拦截**：凡服务端下发包含“异常/重置/过快”等指令，统一改写为成功状态；
