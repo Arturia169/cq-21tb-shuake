@@ -1,0 +1,88 @@
+# ⚡ 重庆专技公需课（21tb）全自动刷课助手
+
+<p align="center">
+  <img src="https://img.shields.io/badge/version-1.12.0-blue.svg?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/platform-Tampermonkey%20%7C%20Violentmonkey-green.svg?style=flat-square" alt="Platform">
+  <img src="https://img.shields.io/badge/support-Chrome%20%7C%20Edge%20%7C%20Safari%20%7C%20Firefox-orange.svg?style=flat-square" alt="Browsers">
+  <img src="https://img.shields.io/badge/license-MIT-lightgrey.svg?style=flat-square" alt="License">
+</p>
+
+一款专为**重庆市专业技术人员继续教育公需科目培训平台（cqrl.21tb.com）**打造的现代化、全自动、黑科技级油猴辅助脚本。
+
+深度逆向融合了官方后端通讯 API 与原生 DOM 兜底机制，实现**“全年度大类目 ➔ 小科目 ➔ 课程 ➔ 章节播放 ➔ 结业考试提醒 ➔ 自动下一大类目”**的真正无人值守全自动大闭环。
+
+---
+
+## 🚀 极速一键安装
+
+> ⚠️ **前置要求**：请先确保浏览器已安装 [Tampermonkey（篡改猴）](https://www.tampermonkey.net/) 插件。
+
+| 安装渠道 | 安装直链 | 适用场景 |
+| :--- | :--- | :--- |
+| **🚀 国内极速镜像（强烈推荐）** | [👉 点击一键秒装](https://ghfast.top/https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js) | 国内网络直连，无需代理，秒响应 |
+| **🌐 GitHub 官方原生直链** | [👉 点击安装](https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js) | 适合已开启科学上网或海外环境 |
+
+---
+
+## ✨ 核心特性一览
+
+### 1. 📡 官方后端 API 深度直连
+- **指标零误差直连**：直调官方阶段与项目接口，50ms 内获取官方必修/选修合格线与已完成差额，杜绝页面样式变动导致的正则匹配偏差；
+- **全量课程瞬间秒查**：进入大类目瞬间异步拉取全部课程（`pageSize=100`），免除逐页点击「下一页」的繁琐渲染等待；
+- **24 小时心跳保活**：每 10 分钟自动与服务器交互续签会话（`elnSessionId`），通宵挂机永不掉线；
+- **结业准考自检与直达**：学分修满瞬间异步自检结业考试权限，悬浮窗直推快速通道；
+- **官方证书自查微抽屉**：直连重庆人社备案证书库，实时查看合格年度、发证记录与学时证明。
+
+### 2. 🛡️ 上帝模式与防封护盾
+- **反作弊配置篡改**：在原生 DOM 上下文拦截 `showCourseSettingConfig`，强制解锁高倍速限制、拖拽进度条限制，清空最低学习时间（`minStudyTime=0`）；
+- **进度拉回拦截**：接管底层 `HTMLMediaElement.prototype.currentTime`，拦截平台恶意倒退进度的作弊惩罚；
+- **异常响应拦截**：凡服务端下发包含“异常/重置/过快”等指令，统一改写为成功状态；
+- **后台播放伪装**：深度劫持 `document.hidden`、`visibilitychange`，接管 `requestAnimationFrame` 防降频，后台切标签、最小化窗口绝不暂停。
+
+### 3. 🎯 全年度多类目流水线大闭环
+- **贪心算法高分攻坚**：优先攻坚最高学分课程（如 13分/12分课），以最快速度修满学分，自动跳过 1 分低分课；
+- **全年度智能调度**：当前攻坚年度优先 ➔ 最新年份优先 ➔ 高进度冲刺（进度差≥10%）➔ 自然序；
+- **故障与死循环保护**：无可用课程或异常时自动加入 2 小时冷却池，跳向下一大类目，拒绝原地打转。
+
+### 4. 🎨 现代化拟态悬浮窗
+- **可拖拽停靠**：平滑拖动，边缘防溢出，位置自动持久化记录；
+- **实时学分仪表盘**：直观展示必修/选修缺额，标明 `📡 官方直连` 专属状态；
+- **课程列表树**：可折叠展开当前年度全部课程，攻坚课程、跳过课程、已完成课程一目了然。
+
+---
+
+## 💻 跨设备（Win ➔ Mac）全自动无感同步
+
+本项目已内置 GitHub 自动更新协议（`@updateURL`）。如果你拥有两台电脑（如 Windows 主机开发 + Mac 笔记本刷课）：
+
+### 以后在 Windows 端的极简工作流：
+在 Windows 端修改完代码后，只需要在终端运行：
+```powershell
+node publish.js "本次修改的说明"
+```
+
+该脚本将全自动完成：
+1. 自动将脚本头部的 `// @version` 递增（如 `1.12.0` ➔ `1.12.1`）；
+2. 自动执行 `git add .` 与 `git commit`；
+3. 自动推送到 GitHub 远程仓库；
+4. **Mac 端无需任何操作**：打开 Mac 上的 Chrome 访问刷课网页时，油猴检测到版本升级，会在后台**全自动静默下载安装最新版**！
+
+---
+
+## 📂 项目结构
+
+```text
+cq-21tb-shuake/
+├── 刷课助手 - 稳定优化版.user.js  # 核心油猴用户脚本
+├── publish.js                    # Windows 端一键递增版本并推送发布脚本
+├── .gitignore                    # Git 忽略配置
+└── README.md                     # 项目说明文档
+```
+
+---
+
+## ⚠️ 免责声明
+
+1. 本脚本仅供个人学习、技术研究与浏览器扩展开发交流使用；
+2. 请合理使用网络资源，遵守所在机构与平台的相关培训学习规定；
+3. 因使用本脚本产生的任何后果，作者不承担任何连带责任。
