@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.15.5
+// @version      1.15.6
 // @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://testingcf.jsdelivr.net/gh/Arturia169/cq-21tb-shuake@main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -1923,109 +1923,189 @@
     }
     fleetBox.style.display = 'block';
 
-const conc = HeadlessFleetManager.getConcurrency();
+    const conc = HeadlessFleetManager.getConcurrency();
     const speed = HeadlessFleetManager.getSpeed ? HeadlessFleetManager.getSpeed() : 16;
     const workers = HeadlessFleetManager.getActiveWorkersStatus();
     const qCount = HeadlessFleetManager.getQueueCount();
     const cCount = HeadlessFleetManager.getCompletedCount();
 
-    let cardsHtml = '';
+    // 1. 初始化 DOM 框架骨架（仅在第一次进入时构建，绝不推倒重置，保障滚动条坚如磐石）
+    let listEl = fleetBox.querySelector('.ap-fleet-list');
+    if (!listEl) {
+      fleetBox.innerHTML =
+        '<div class="ap-fleet-header">' +
+          '<label class="ap-fleet-label" title="开启后无需打开播放页，全部在当前标签页纯后台0%CPU静默多课并发刷课">' +
+            '<input type="checkbox" id="tb21-headless-toggle"' + (isFleetActive ? ' checked' : '') + '>' +
+            '<span>🚀 纯后台静默舰队</span>' +
+          '</label>' +
+          '<span class="ap-fleet-status-tag"></span>' +
+        '</div>' +
+        '<div class="ap-fleet-ctrl-grid">' +
+          '<div class="ap-fleet-conc-row">' +
+            '<span class="ap-fleet-conc-title" title="后台同时挂机的课程数量">并发路数:</span>' +
+            '<div class="ap-fleet-conc-btns">' +
+              '<button class="ap-conc-btn' + (conc === 2 ? ' active' : '') + '" data-conc="2" title="同时静默挂机2门课">2门</button>' +
+              '<button class="ap-conc-btn' + (conc === 3 ? ' active' : '') + '" data-conc="3" title="同时静默挂机3门课(推荐)">3门(推荐)</button>' +
+              '<button class="ap-conc-btn' + (conc === 5 ? ' active' : '') + '" data-conc="5" title="同时静默挂机5门课">5门</button>' +
+            '</div>' +
+          '</div>' +
+          '<div class="ap-fleet-conc-row">' +
+            '<span class="ap-fleet-conc-title" title="每门静默课程的虚拟时钟推进倍速">单课倍速:</span>' +
+            '<div class="ap-fleet-conc-btns">' +
+              '<button class="ap-speed-btn' + (speed === 2 ? ' active' : '') + '" data-speed="2" title="2x 稳健模式（单课2x，3门并发等效6x）">2x稳健</button>' +
+              '<button class="ap-speed-btn' + (speed === 16 ? ' active' : '') + '" data-speed="16" title="16x 极速冲刺模式（单课16x，3门并发等效48x，5门并发等效80x！）" style="color:' + (speed === 16 ? '#fff' : '#f59e0b') + '">⚡ 16x狂飙 ★</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="ap-fleet-list"></div>' +
+        '<div class="ap-fleet-footer" style="font-size:10px;color:#64748b;margin-top:4px;display:flex;justify-content:space-between;"></div>';
+
+      listEl = fleetBox.querySelector('.ap-fleet-list');
+
+      const toggle = fleetBox.querySelector('#tb21-headless-toggle');
+      if (toggle) {
+        toggle.addEventListener('change', function () {
+          if (toggle.checked) {
+            HeadlessFleetManager.start();
+            scanAndDispatchFleet();
+          } else {
+            HeadlessFleetManager.stop();
+          }
+          renderFleetDashboard();
+        });
+      }
+
+      fleetBox.querySelectorAll('.ap-conc-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          const c = parseInt(btn.dataset.conc, 10);
+          HeadlessFleetManager.setConcurrency(c);
+          if (!HeadlessFleetManager.isFleetRunning()) HeadlessFleetManager.start();
+          scanAndDispatchFleet();
+          renderFleetDashboard();
+        });
+      });
+
+      fleetBox.querySelectorAll('.ap-speed-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          const s = parseInt(btn.dataset.speed, 10);
+          HeadlessFleetManager.setSpeed(s);
+          renderFleetDashboard();
+        });
+      });
+    }
+
+    // 2. 状态与控制项差量精准更新
+    const toggle = fleetBox.querySelector('#tb21-headless-toggle');
+    if (toggle) toggle.checked = isFleetActive;
+
+    const statusTag = fleetBox.querySelector('.ap-fleet-status-tag');
+    if (statusTag) {
+      statusTag.style.cssText = 'font-size:10px;padding:1px 6px;border-radius:4px;' +
+        (isFleetActive ? 'background:rgba(16,185,129,.15);color:#10b981;border:1px solid rgba(16,185,129,.3);' : 'background:rgba(148,163,184,.1);color:#94a3b8;');
+      statusTag.textContent = isFleetActive ? ('🟢 运行中 (' + workers.length + '/' + conc + '线)') : '⚪ 已就绪';
+    }
+
+    fleetBox.querySelectorAll('.ap-conc-btn').forEach(function (btn) {
+      const c = parseInt(btn.dataset.conc, 10);
+      btn.classList.toggle('active', c === conc);
+    });
+
+    fleetBox.querySelectorAll('.ap-speed-btn').forEach(function (btn) {
+      const s = parseInt(btn.dataset.speed, 10);
+      btn.classList.toggle('active', s === speed);
+    });
+
+    const footer = fleetBox.querySelector('.ap-fleet-footer');
+    if (footer) {
+      footer.style.display = isFleetActive ? 'flex' : 'none';
+      footer.innerHTML = '<span>已结课: ' + cCount + ' 门</span><span>排队中: ' + qCount + ' 门</span>';
+    }
+
+    // 3. 极速就地差量更新 / 锁定滚动条（彻底终结滚动条跳回原位的顽疾！）
     if (!isFleetActive) {
-      cardsHtml = '<div class="ap-fleet-empty">静默舰队未启动（勾选开启0%CPU多课并发）</div>';
-    } else if (workers.length === 0) {
-      cardsHtml = '<div class="ap-fleet-empty">' + (qCount > 0 ? ('正在调度队列中 ' + qCount + ' 门课程...') : '队列暂无课程 <button id="tb21-btn-force-scan" style="background:#0284c7;color:#fff;border:none;padding:1px 6px;border-radius:4px;cursor:pointer;margin-left:4px;font-size:10px;">重新扫描</button>') + '</div>';
+      const emptyHtml = '<div class="ap-fleet-empty" style="grid-column:1/-1;">静默舰队未启动（勾选开启0%CPU多课并发）</div>';
+      if (listEl._lastHtml !== emptyHtml) {
+        listEl.innerHTML = emptyHtml;
+        listEl._lastHtml = emptyHtml;
+      }
+      return;
+    }
+
+    if (workers.length === 0) {
+      const idleHtml = '<div class="ap-fleet-empty" style="grid-column:1/-1;">' + (qCount > 0 ? ('正在调度队列中 ' + qCount + ' 门课程...') : '队列暂无课程 <button id="tb21-btn-force-scan" style="background:#0284c7;color:#fff;border:none;padding:1px 6px;border-radius:4px;cursor:pointer;margin-left:4px;font-size:10px;">重新扫描</button>') + '</div>';
+      if (listEl._lastHtml !== idleHtml) {
+        listEl.innerHTML = idleHtml;
+        listEl._lastHtml = idleHtml;
+        const forceScanBtn = listEl.querySelector('#tb21-btn-force-scan');
+        if (forceScanBtn) {
+          forceScanBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            forceScanBtn.textContent = '扫描中...';
+            if (!HeadlessFleetManager.isFleetRunning()) HeadlessFleetManager.start();
+            scanAndDispatchFleet().then(function() {
+              renderFleetDashboard();
+            });
+          });
+        }
+      }
+      return;
+    }
+
+    // 检查现有卡片是否与当前活跃课程一一对应
+    const existingCards = listEl.querySelectorAll('.ap-fleet-card');
+    const existingCids = Array.from(existingCards).map(function(c) { return c.dataset.cid; }).join(',');
+    const newCids = workers.map(function(w) { return String(w.courseId); }).join(',');
+
+    if (existingCards.length > 0 && existingCids === newCids) {
+      // 核心突破：DOM 节点 100% 保持不动！只更新文字与进度条属性！
+      // 滚动条事件、拖动状态、鼠标悬停 0 干扰，绝不会发生任何重绘回弹！
+      workers.forEach(function (w) {
+        const card = listEl.querySelector('.ap-fleet-card[data-cid="' + w.courseId + '"]');
+        if (!card) return;
+        const timeEl = card.querySelector('.ap-fleet-time');
+        if (timeEl && timeEl.textContent !== '⏱️ ' + w.remainText) {
+          timeEl.textContent = '⏱️ ' + w.remainText;
+        }
+        const secEl = card.querySelector('.ap-fleet-sec-info');
+        const secText = (w.totalSections > 0 ? ('第' + w.sectionIndex + '/' + w.totalSections + '节: ' + w.sectionName) : '准备中');
+        if (secEl && secEl.textContent !== secText) {
+          secEl.textContent = secText;
+        }
+        const pctEl = card.querySelector('.ap-fleet-percent');
+        const pctText = w.percent + '%';
+        if (pctEl && pctEl.textContent !== pctText) {
+          pctEl.textContent = pctText;
+        }
+        const barEl = card.querySelector('.ap-fleet-bar');
+        if (barEl) {
+          barEl.style.width = w.percent + '%';
+        }
+      });
     } else {
+      // 仅在课程变动（结课/换课）时重构列表，并严格保留当前滚动位置
+      let cardsHtml = '';
       workers.forEach(function (w) {
         cardsHtml +=
-          '<div class="ap-fleet-card">' +
+          '<div class="ap-fleet-card" data-cid="' + w.courseId + '">' +
             '<div class="ap-fleet-card-title">' +
               '<span class="ap-fleet-cname" title="' + w.courseTitle + '">' + w.courseTitle + '</span>' +
               '<span class="ap-fleet-time">⏱️ ' + w.remainText + '</span>' +
             '</div>' +
             '<div class="ap-fleet-card-sub">' +
-              '<span>' + (w.totalSections > 0 ? ('第' + w.sectionIndex + '/' + w.totalSections + '节: ' + w.sectionName) : '准备中') + '</span>' +
-              '<span>' + w.percent + '%</span>' +
+              '<span class="ap-fleet-sec-info">' + (w.totalSections > 0 ? ('第' + w.sectionIndex + '/' + w.totalSections + '节: ' + w.sectionName) : '准备中') + '</span>' +
+              '<span class="ap-fleet-percent" style="font-weight:700;color:#38bdf8;">' + w.percent + '%</span>' +
             '</div>' +
             '<div class="ap-fleet-track">' +
               '<div class="ap-fleet-bar" style="width:' + w.percent + '%"></div>' +
             '</div>' +
           '</div>';
       });
+
+      const savedScrollTop = listEl.scrollTop;
+      listEl.innerHTML = cardsHtml;
+      listEl._lastHtml = cardsHtml;
+      listEl.scrollTop = savedScrollTop;
     }
-
-    fleetBox.innerHTML =
-      '<div class="ap-fleet-header">' +
-        '<label class="ap-fleet-label" title="开启后无需打开播放页，全部在当前标签页纯后台0%CPU静默多课并发刷课">' +
-          '<input type="checkbox" id="tb21-headless-toggle"' + (isFleetActive ? ' checked' : '') + '>' +
-          '<span>🚀 纯后台静默舰队</span>' +
-        '</label>' +
-        '<span class="ap-fleet-status-tag" style="font-size:10px;padding:1px 6px;border-radius:4px;' +
-          (isFleetActive ? 'background:rgba(16,185,129,.15);color:#10b981;border:1px solid rgba(16,185,129,.3);' : 'background:rgba(148,163,184,.1);color:#94a3b8;') + '">' +
-          (isFleetActive ? ('🟢 运行中 (' + workers.length + '/' + conc + '线)') : '⚪ 已就绪') +
-        '</span>' +
-      '</div>' +
-      '<div class="ap-fleet-conc-row">' +
-        '<span class="ap-fleet-conc-title" title="后台同时挂机的课程数量">并发路数:</span>' +
-        '<div class="ap-fleet-conc-btns">' +
-          '<button class="ap-conc-btn' + (conc === 2 ? ' active' : '') + '" data-conc="2" title="同时静默挂机2门课">2门</button>' +
-          '<button class="ap-conc-btn' + (conc === 3 ? ' active' : '') + '" data-conc="3" title="同时静默挂机3门课(推荐)">3门(推荐)</button>' +
-          '<button class="ap-conc-btn' + (conc === 5 ? ' active' : '') + '" data-conc="5" title="同时静默挂机5门课">5门</button>' +
-        '</div>' +
-      '</div>' +
-      '<div class="ap-fleet-conc-row" style="margin-top:2px;">' +
-        '<span class="ap-fleet-conc-title" title="每门静默课程的虚拟时钟推进倍速">单课倍速:</span>' +
-        '<div class="ap-fleet-conc-btns">' +
-          '<button class="ap-speed-btn' + (speed === 2 ? ' active' : '') + '" data-speed="2" title="2x 稳健模式（单课2x，3门并发等效6x）">2x稳健</button>' +
-          '<button class="ap-speed-btn' + (speed === 16 ? ' active' : '') + '" data-speed="16" title="16x 极速冲刺模式（单课16x，3门并发等效48x，5门并发等效80x！）" style="color:' + (speed === 16 ? '#fff' : '#f59e0b') + '">⚡ 16x狂飙(等效48x~80x) ★</button>' +
-        '</div>' +
-      '</div>' +
-      '<div class="ap-fleet-list">' + cardsHtml + '</div>' +
-      (isFleetActive ? ('<div style="font-size:10px;color:#64748b;margin-top:4px;display:flex;justify-content:space-between;"><span>已结课: ' + cCount + ' 门</span><span>排队中: ' + qCount + ' 门</span></div>') : '');
-
-    const forceScanBtn = fleetBox.querySelector('#tb21-btn-force-scan');
-    if (forceScanBtn) {
-      forceScanBtn.addEventListener('click', function(e) {
-        e.stopPropagation();
-        forceScanBtn.textContent = '扫描中...';
-        if (!HeadlessFleetManager.isFleetRunning()) HeadlessFleetManager.start();
-        scanAndDispatchFleet().then(function() {
-          renderFleetDashboard();
-        });
-      });
-    }
-
-    const toggle = fleetBox.querySelector('#tb21-headless-toggle');
-    if (toggle) {
-      toggle.addEventListener('change', function () {
-        if (toggle.checked) {
-          HeadlessFleetManager.start();
-          scanAndDispatchFleet();
-        } else {
-          HeadlessFleetManager.stop();
-        }
-        renderFleetDashboard();
-      });
-    }
-
-    fleetBox.querySelectorAll('.ap-speed-btn').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        const s = parseInt(btn.dataset.speed, 10);
-        HeadlessFleetManager.setSpeed(s);
-        renderFleetDashboard();
-      });
-    });
-
-    fleetBox.querySelectorAll('.ap-conc-btn').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        const c = parseInt(btn.dataset.conc, 10);
-        HeadlessFleetManager.setConcurrency(c);
-        if (!HeadlessFleetManager.isFleetRunning()) {
-          HeadlessFleetManager.start();
-        }
-        scanAndDispatchFleet();
-        renderFleetDashboard();
-      });
-    });
   }
   HeadlessFleetManager.onUpdate(renderFleetDashboard);
 
@@ -2040,7 +2120,7 @@ const conc = HeadlessFleetManager.getConcurrency();
     }
     const css = document.createElement('style');
     css.textContent = `
-      #tb21-auto-panel{position:fixed;top:14px;right:14px;z-index:999999;width:300px;
+      #tb21-auto-panel{position:fixed;top:14px;right:14px;z-index:999999;width:500px;max-width:calc(100vw - 28px);
         background:rgba(15,23,42,.88);color:#f1f5f9;border-radius:14px;
         font:12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
         box-shadow:0 16px 36px -6px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.1),inset 0 1px 0 rgba(255,255,255,.15);
@@ -2062,7 +2142,7 @@ const conc = HeadlessFleetManager.getConcurrency();
       @keyframes ap-pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.25);opacity:.75}}
       #tb21-auto-panel .ap-fold{cursor:pointer;padding:2px 6px;color:#94a3b8;font-size:13px;border-radius:4px;transition:transform .2s,color .2s,background .2s}
       #tb21-auto-panel .ap-fold:hover{color:#f1f5f9;background:rgba(255,255,255,.08)}
-      #tb21-auto-panel .ap-body{padding:10px 12px 12px}
+      #tb21-auto-panel .ap-body{padding:10px 12px 12px;max-height:calc(100vh - 60px);overflow-y:auto}
       #tb21-auto-panel .ap-status{margin-bottom:8px;font-size:11px;display:flex;align-items:center;gap:6px}
       #tb21-auto-panel .ap-status .running{color:#34d399;font-weight:600;display:inline-flex;align-items:center;gap:4px}
       #tb21-auto-panel .ap-status .stopped{color:#f87171;font-weight:600;display:inline-flex;align-items:center;gap:4px}
@@ -2081,18 +2161,19 @@ const conc = HeadlessFleetManager.getConcurrency();
       #tb21-auto-panel .ap-fleet-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
       #tb21-auto-panel .ap-fleet-label{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;color:#38bdf8;cursor:pointer}
       #tb21-auto-panel .ap-fleet-label input{accent-color:#0284c7;cursor:pointer}
-      #tb21-auto-panel .ap-fleet-conc-row{display:flex;align-items:center;justify-content:space-between;margin:4px 0 6px;padding:4px 6px;background:rgba(255,255,255,.03);border-radius:6px;border:1px solid rgba(255,255,255,.05)}
+      #tb21-auto-panel .ap-fleet-ctrl-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:4px 0 6px}
+      #tb21-auto-panel .ap-fleet-conc-row{display:flex;align-items:center;justify-content:space-between;padding:4px 6px;background:rgba(255,255,255,.03);border-radius:6px;border:1px solid rgba(255,255,255,.05)}
       #tb21-auto-panel .ap-fleet-conc-title{font-size:10px;color:#94a3b8;font-weight:600}
-      #tb21-auto-panel .ap-fleet-conc-btns{display:flex;align-items:center;gap:4px}
-      #tb21-auto-panel .ap-conc-btn,#tb21-auto-panel .ap-speed-btn{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#94a3b8;font-size:10px;padding:2px 6px;border-radius:4px;cursor:pointer;transition:all .2s;white-space:nowrap}
-      #tb21-auto-panel .ap-speed-btn:hover{color:#fff;background:rgba(255,255,255,.14)}
+      #tb21-auto-panel .ap-fleet-conc-btns{display:flex;align-items:center;gap:3px}
+      #tb21-auto-panel .ap-conc-btn,#tb21-auto-panel .ap-speed-btn{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#94a3b8;font-size:10px;padding:2px 5px;border-radius:4px;cursor:pointer;transition:all .2s;white-space:nowrap}
+      #tb21-auto-panel .ap-speed-btn:hover,#tb21-auto-panel .ap-conc-btn:hover{color:#fff;background:rgba(255,255,255,.14)}
       #tb21-auto-panel .ap-speed-btn.active{background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;border-color:#fbbf24;font-weight:700;box-shadow:0 0 8px rgba(245,158,11,.4)}
-      #tb21-auto-panel .ap-conc-btn:hover{color:#fff;background:rgba(255,255,255,.14)}
       #tb21-auto-panel .ap-conc-btn.active{background:linear-gradient(135deg,#0284c7,#0369a1);color:#fff;border-color:#38bdf8;font-weight:700;box-shadow:0 0 8px rgba(56,189,248,.35)}
-      #tb21-auto-panel .ap-fleet-list{display:flex;flex-direction:column;gap:5px;max-height:160px;overflow-y:auto;padding-right:2px}
-      #tb21-auto-panel .ap-fleet-card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);border-radius:6px;padding:5px 7px}
-      #tb21-auto-panel .ap-fleet-card-title{display:flex;justify-content:space-between;align-items:center;font-size:11px;font-weight:600;color:#f1f5f9}
-      #tb21-auto-panel .ap-fleet-cname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:180px}
+      #tb21-auto-panel .ap-fleet-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:6px;max-height:220px;overflow-y:auto;padding-right:2px}
+      #tb21-auto-panel .ap-fleet-card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);border-radius:6px;padding:6px 8px;display:flex;flex-direction:column;justify-content:space-between;min-height:58px;transition:all .15s}
+      #tb21-auto-panel .ap-fleet-card:hover{border-color:rgba(56,189,248,.35);background:rgba(255,255,255,.07)}
+      #tb21-auto-panel .ap-fleet-card-title{display:flex;justify-content:space-between;align-items:center;font-size:11px;font-weight:600;color:#f1f5f9;gap:6px}
+      #tb21-auto-panel .ap-fleet-cname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
       #tb21-auto-panel .ap-fleet-time{color:#fbbf24;font-size:10px;font-family:monospace}
       #tb21-auto-panel .ap-fleet-card-sub{display:flex;justify-content:space-between;font-size:10px;color:#94a3b8;margin-top:2px}
       #tb21-auto-panel .ap-fleet-track{height:3px;background:rgba(255,255,255,.1);border-radius:2px;overflow:hidden;margin-top:4px}
@@ -2181,7 +2262,7 @@ const conc = HeadlessFleetManager.getConcurrency();
     try {
       const pos = JSON.parse(localStorage.getItem('tb21_auto_pos') || 'null');
       if (pos && typeof pos.x === 'number') {
-        const w = panel.offsetWidth || 300;
+        const w = panel.offsetWidth || 500;
         const h = panel.offsetHeight || 160;
         panel.style.left = Math.max(0, Math.min(pos.x, window.innerWidth - w)) + 'px';
         panel.style.top = Math.max(0, Math.min(pos.y, window.innerHeight - h)) + 'px';
@@ -2213,7 +2294,7 @@ const conc = HeadlessFleetManager.getConcurrency();
         rafId = requestAnimationFrame(function () {
           rafId = null;
           if (!drag) return;
-          const pw = panel.offsetWidth || 300;
+          const pw = panel.offsetWidth || 500;
           const ph = panel.offsetHeight || 160;
           const maxLeft = Math.max(0, window.innerWidth - pw);
           const maxTop = Math.max(0, window.innerHeight - ph);
