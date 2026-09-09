@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.14.1
-// @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
+// @version      1.15.0
+// @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
 // @downloadURL  https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -1112,6 +1112,419 @@
     };
   })();
 
+  /* ---------- 🚀 纯后台无头虚拟刷课执行器 (VirtualCourseWorker) ---------- */
+  function VirtualCourseWorker(courseInfo, callbacks) {
+    const courseId = String(courseInfo.courseId || courseInfo.id || '');
+    const courseTitle = courseInfo.title || courseInfo.courseName || '未命名课程';
+    let state = 'INIT'; // INIT, RUNNING, FINISHED, ERROR, DESTROYED
+    let currentSection = null;
+    let sectionIndex = 0;
+    let totalSections = 0;
+    let elapsedSec = 0;
+    let targetSec = 0;
+    let virtualPos = 0;
+    let timer = null;
+    let isDestroyed = false;
+
+    function formatTime(sec) {
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      return (m < 10 ? '0' + m : m) + ':' + (s < 10 ? '0' + s : s);
+    }
+
+    function notifyStatus() {
+      if (callbacks && callbacks.onStatusChange) {
+        callbacks.onStatusChange(getStatus());
+      }
+    }
+
+    async function start() {
+      if (isDestroyed) return;
+      try {
+        state = 'INIT';
+        notifyStatus();
+
+        // 1. 获取小节列表
+        const chapData = await TbApiClient.post('/tbc-rms/course/showCourseChapter', { courseId: courseId });
+        if (!chapData || !chapData.bizResult || !Array.isArray(chapData.bizResult)) {
+          state = 'ERROR';
+          notifyStatus();
+          if (callbacks && callbacks.onError) callbacks.onError('获取课程结构失败');
+          return;
+        }
+
+        // 2. 获取已有记录
+        const recordMap = {};
+        const finishMap = {};
+        try {
+          const recData = await TbApiClient.post('/tbc-rms/record/getStudyRecordList', {
+            courseId: courseId,
+            sourceId: courseInfo.sourceId || '',
+            providerCorpCode: courseInfo.providerCorpCode || ''
+          });
+          if (recData && recData.bizResult && Array.isArray(recData.bizResult)) {
+            recData.bizResult.forEach(function (r) {
+              if (r.resourceId) {
+                recordMap[r.resourceId] = r.recordId;
+                if (r.confirmFinish === 1) finishMap[r.resourceId] = true;
+              }
+            });
+          }
+        } catch (e) {}
+
+        // 3. 汇总未完成小节
+        const pendingList = [];
+        chapData.bizResult.forEach(function (chap) {
+          if (chap && Array.isArray(chap.resourceDTOS)) {
+            chap.resourceDTOS.forEach(function (res) {
+              if (!finishMap[res.resourceId] && !res.confirmFinish && !res.finish) {
+                pendingList.push({
+                  chapterId: chap.chapterId,
+                  resourceId: res.resourceId,
+                  resourceName: res.resourceName || '小节',
+                  resourceType: res.resourceType || 'video',
+                  timeToFinish: Number(res.timeToFinish || res.minStudyTime || 300),
+                  currentStudyTime: Number(res.currentStudyTime || 0),
+                  recordId: recordMap[res.resourceId] || null
+                });
+              }
+            });
+          }
+        });
+
+        totalSections = pendingList.length;
+        if (totalSections === 0) {
+          state = 'FINISHED';
+          notifyStatus();
+          if (callbacks && callbacks.onComplete) callbacks.onComplete(courseId, courseTitle);
+          return;
+        }
+
+        // 4. 逐节执行
+        for (let i = 0; i < pendingList.length; i++) {
+          if (isDestroyed) return;
+          sectionIndex = i + 1;
+          currentSection = pendingList[i];
+          await runSection(currentSection);
+        }
+
+        // 5. 完结整门课
+        state = 'FINISHED';
+        try {
+          await TbApiClient.post('/tbc-rms/record/syncStudyRecord', {
+            courseId: courseId,
+            sourceId: courseInfo.sourceId || '',
+            providerCorpCode: courseInfo.providerCorpCode || ''
+          });
+        } catch (e) {}
+        notifyStatus();
+        if (callbacks && callbacks.onComplete) callbacks.onComplete(courseId, courseTitle);
+      } catch (err) {
+        state = 'ERROR';
+        notifyStatus();
+        if (callbacks && callbacks.onError) callbacks.onError(err);
+      }
+    }
+
+    function runSection(sec) {
+      return new Promise(function (resolve) {
+        if (isDestroyed) { resolve(); return; }
+
+        // 非视频类（文档/网页/图文）：0.5s 极速秒结
+        if (sec.resourceType !== 'video' && sec.resourceType !== 'audio') {
+          (async function () {
+            try {
+              await TbApiClient.post('/biz-oim/course/saveStudyLog.do?courseId=' + courseId, {
+                studyLogVO: {
+                  courseItemId: sec.resourceId,
+                  courseItemName: sec.resourceName,
+                  courseId: courseId,
+                  videoDuration: 1000
+                },
+                eventType: 'ENTER_COURSE_ITEM'
+              });
+              await TbApiClient.post('/tbc-rms/record/updateCourseRecord', {
+                recordId: sec.recordId,
+                courseId: courseId,
+                chapterId: sec.chapterId,
+                resourceId: sec.resourceId,
+                timeToFinish: 1,
+                currentPosition: 1,
+                type: sec.resourceType,
+                currentStudyTime: 1,
+                pageIndex: 1
+              });
+              await TbApiClient.post('/biz-oim/course/saveStudyLog.do?courseId=' + courseId, {
+                studyLogVO: {
+                  courseItemId: sec.resourceId,
+                  courseItemName: sec.resourceName,
+                  courseId: courseId,
+                  videoDuration: 1000
+                },
+                eventType: 'COMPLETE_COURSE_ITEM'
+              });
+            } catch (e) {}
+            resolve();
+          })();
+          return;
+        }
+
+        // 视频类：合规 2.0x 虚拟时钟推进（单次不少于50%物理时长）
+        const dur = Math.max(10, sec.timeToFinish);
+        const reqWait = Math.ceil(dur * 0.5);
+        const already = sec.currentStudyTime || 0;
+        const remainWait = Math.max(12, reqWait - already);
+        elapsedSec = 0;
+        targetSec = remainWait;
+        state = 'RUNNING';
+        notifyStatus();
+
+        // 进课握手
+        TbApiClient.post('/biz-oim/course/saveStudyLog.do?courseId=' + courseId, {
+          studyLogVO: {
+            courseItemId: sec.resourceId,
+            courseItemName: sec.resourceName,
+            courseId: courseId,
+            videoDuration: dur * 1000
+          },
+          eventType: 'ENTER_COURSE_ITEM'
+        }).catch(function () {});
+
+        TbApiClient.post('/biz-oim/course/saveStudyLog.do?courseId=' + courseId, {
+          studyLogVO: {
+            courseItemId: sec.resourceId,
+            courseItemName: sec.resourceName,
+            courseId: courseId,
+            videoDuration: dur * 1000
+          },
+          eventType: 'PLAY'
+        }).catch(function () {});
+
+        timer = setInterval(async function () {
+          if (isDestroyed) {
+            clearInterval(timer);
+            timer = null;
+            resolve();
+            return;
+          }
+          elapsedSec++;
+          virtualPos = Math.min(dur, Math.round(already * 2 + elapsedSec * 2));
+          notifyStatus();
+
+          // 每 60 秒心跳保活
+          if (elapsedSec % 60 === 0) {
+            TbApiClient.get('/ubr/heartbeat/beat', { courseId: courseId }).catch(function () {});
+          }
+
+          // 每 180 秒进度存档
+          if (elapsedSec % 180 === 0) {
+            TbApiClient.post('/tbc-rms/record/updateCourseRecord', {
+              recordId: sec.recordId,
+              courseId: courseId,
+              chapterId: sec.chapterId,
+              resourceId: sec.resourceId,
+              timeToFinish: dur,
+              currentPosition: virtualPos,
+              type: 'video',
+              currentStudyTime: already + elapsedSec,
+              pageIndex: 0
+            }).catch(function () {});
+          }
+
+          // 结课判定
+          if (elapsedSec >= remainWait) {
+            clearInterval(timer);
+            timer = null;
+            try {
+              await TbApiClient.post('/biz-oim/course/saveStudyLog.do?courseId=' + courseId, {
+                studyLogVO: {
+                  courseItemId: sec.resourceId,
+                  courseItemName: sec.resourceName,
+                  courseId: courseId,
+                  videoDuration: dur * 1000
+                },
+                eventType: 'COMPLETE_COURSE_ITEM'
+              });
+              await TbApiClient.post('/tbc-rms/record/updateCourseRecord', {
+                recordId: sec.recordId,
+                courseId: courseId,
+                chapterId: sec.chapterId,
+                resourceId: sec.resourceId,
+                timeToFinish: dur,
+                currentPosition: dur,
+                type: 'video',
+                currentStudyTime: Math.max(Math.round(dur * 0.55), already + elapsedSec),
+                pageIndex: 0
+              });
+              await TbApiClient.post('/tbc-rms/record/syncStudyRecord', {
+                courseId: courseId,
+                sourceId: courseInfo.sourceId || '',
+                providerCorpCode: courseInfo.providerCorpCode || ''
+              });
+            } catch (e) {}
+            resolve();
+          }
+        }, 1000);
+      });
+    }
+
+    function destroy() {
+      isDestroyed = true;
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      state = 'DESTROYED';
+    }
+
+    function getStatus() {
+      const percent = targetSec > 0 ? Math.min(100, Math.round((elapsedSec / targetSec) * 100)) : (state === 'FINISHED' ? 100 : 0);
+      const remainSec = Math.max(0, targetSec - elapsedSec);
+      return {
+        courseId: courseId,
+        courseTitle: courseTitle,
+        sectionIndex: sectionIndex,
+        totalSections: totalSections,
+        sectionName: currentSection ? currentSection.resourceName : '',
+        percent: percent,
+        remainSec: remainSec,
+        remainText: formatTime(remainSec),
+        state: state
+      };
+    }
+
+    return {
+      start: start,
+      destroy: destroy,
+      getStatus: getStatus
+    };
+  }
+
+  /* ---------- 🚀 纯后台无头静默舰队调度中心 (HeadlessFleetManager) ---------- */
+  const HeadlessFleetManager = (function () {
+    let isRunning = false;
+    let concurrency = 3;
+    let queue = [];
+    let workers = [];
+    let completedCourses = [];
+    const listeners = [];
+
+    function loadSettings() {
+      try {
+        concurrency = Math.max(1, Math.min(8, parseInt(localStorage.getItem('tb21_headless_concurrency'), 10) || 3));
+        isRunning = localStorage.getItem('tb21_headless_active') === '1';
+      } catch (e) { concurrency = 3; isRunning = false; }
+    }
+    loadSettings();
+
+    function setConcurrency(c) {
+      concurrency = Math.max(1, Math.min(8, c));
+      try { localStorage.setItem('tb21_headless_concurrency', String(concurrency)); } catch (e) {}
+      dispatch();
+      notify();
+    }
+
+    function getConcurrency() { return concurrency; }
+
+    function addCourse(courseInfo) {
+      if (!courseInfo || !courseInfo.courseId) return;
+      const cid = String(courseInfo.courseId);
+      if (queue.some(function (c) { return String(c.courseId) === cid; })) return;
+      if (workers.some(function (w) { return String(w.getStatus().courseId) === cid; })) return;
+      if (completedCourses.indexOf(cid) > -1) return;
+      queue.push(courseInfo);
+      if (isRunning) dispatch();
+    }
+
+    function setCourses(courses) {
+      if (!Array.isArray(courses)) return;
+      courses.forEach(addCourse);
+    }
+
+    function dispatch() {
+      if (!isRunning) return;
+      while (workers.length < concurrency && queue.length > 0) {
+        const course = queue.shift();
+        const worker = new VirtualCourseWorker(course, {
+          onStatusChange: function () { notify(); },
+          onComplete: function (cid, title) {
+            completedCourses.push(String(cid));
+            console.log('[刷课助手-静默舰队] 🏆 课程已在纯后台完播结课: ' + title);
+            try {
+              const cards = document.querySelectorAll('.text-item.cursor');
+              cards.forEach(function (c) {
+                if (getCardCourseId(c) === cid) {
+                  const info = c.querySelector('.text-info');
+                  if (info && info.textContent.indexOf('已完成') === -1) {
+                    info.textContent = info.textContent + ' (已完成)';
+                  }
+                }
+              });
+            } catch (e) {}
+            workers = workers.filter(function (w) { return w !== worker; });
+            dispatch();
+            notify();
+          },
+          onError: function (err) {
+            console.warn('[刷课助手-静默舰队] ⚠️ 任务执行异常:', err);
+            workers = workers.filter(function (w) { return w !== worker; });
+            dispatch();
+            notify();
+          }
+        });
+        workers.push(worker);
+        worker.start();
+      }
+      notify();
+    }
+
+    function start() {
+      isRunning = true;
+      try { localStorage.setItem('tb21_headless_active', '1'); } catch (e) {}
+      loadSettings();
+      dispatch();
+      notify();
+    }
+
+    function stop() {
+      isRunning = false;
+      try { localStorage.setItem('tb21_headless_active', '0'); } catch (e) {}
+      workers.forEach(function (w) { w.destroy(); });
+      workers = [];
+      notify();
+    }
+
+    function getActiveWorkersStatus() {
+      return workers.map(function (w) { return w.getStatus(); });
+    }
+
+    function isFleetRunning() { return isRunning; }
+    function getQueueCount() { return queue.length; }
+    function getCompletedCount() { return completedCourses.length; }
+
+    function onUpdate(cb) {
+      if (typeof cb === 'function') listeners.push(cb);
+    }
+
+    function notify() {
+      listeners.forEach(function (cb) { try { cb(); } catch (e) {} });
+    }
+
+    return {
+      start: start,
+      stop: stop,
+      addCourse: addCourse,
+      setCourses: setCourses,
+      setConcurrency: setConcurrency,
+      getConcurrency: getConcurrency,
+      getActiveWorkersStatus: getActiveWorkersStatus,
+      isFleetRunning: isFleetRunning,
+      getQueueCount: getQueueCount,
+      getCompletedCount: getCompletedCount,
+      onUpdate: onUpdate
+    };
+  })();
+
   function getRouteQueryParams() {
     const hash = location.hash || '';
     const qIdx = hash.indexOf('?');
@@ -1247,6 +1660,23 @@
       #tb21-auto-panel .ap-credit-card{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:8px;padding:6px 8px;display:flex;flex-direction:column;gap:1px}
       #tb21-auto-panel .ap-credit-card.req{border-left:3px solid #38bdf8}
       #tb21-auto-panel .ap-credit-card.ele{border-left:3px solid #c084fc}
+      #tb21-auto-panel .ap-fleet-box{margin-top:8px;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:8px}
+      #tb21-auto-panel .ap-fleet-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+      #tb21-auto-panel .ap-fleet-label{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;color:#38bdf8;cursor:pointer}
+      #tb21-auto-panel .ap-fleet-label input{accent-color:#0284c7;cursor:pointer}
+      #tb21-auto-panel .ap-fleet-conc-btns{display:flex;align-items:center;gap:3px}
+      #tb21-auto-panel .ap-conc-btn{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:#94a3b8;font-size:10px;padding:1px 6px;border-radius:4px;cursor:pointer;transition:all .2s}
+      #tb21-auto-panel .ap-conc-btn:hover{color:#fff;background:rgba(255,255,255,.12)}
+      #tb21-auto-panel .ap-conc-btn.active{background:#0284c7;color:#fff;border-color:#38bdf8;font-weight:700}
+      #tb21-auto-panel .ap-fleet-list{display:flex;flex-direction:column;gap:5px;max-height:160px;overflow-y:auto;padding-right:2px}
+      #tb21-auto-panel .ap-fleet-card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);border-radius:6px;padding:5px 7px}
+      #tb21-auto-panel .ap-fleet-card-title{display:flex;justify-content:space-between;align-items:center;font-size:11px;font-weight:600;color:#f1f5f9}
+      #tb21-auto-panel .ap-fleet-cname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:180px}
+      #tb21-auto-panel .ap-fleet-time{color:#fbbf24;font-size:10px;font-family:monospace}
+      #tb21-auto-panel .ap-fleet-card-sub{display:flex;justify-content:space-between;font-size:10px;color:#94a3b8;margin-top:2px}
+      #tb21-auto-panel .ap-fleet-track{height:3px;background:rgba(255,255,255,.1);border-radius:2px;overflow:hidden;margin-top:4px}
+      #tb21-auto-panel .ap-fleet-bar{height:100%;background:linear-gradient(90deg,#0ea5e9,#10b981);transition:width .5s ease}
+      #tb21-auto-panel .ap-fleet-empty{color:#64748b;font-size:10px;text-align:center;padding:6px 0}
       #tb21-auto-panel .ap-card-label{font-size:10px;color:#94a3b8;font-weight:600;display:flex;justify-content:space-between}
       #tb21-auto-panel .ap-card-val{font-size:13px;font-weight:700;color:#f8fafc;margin:2px 0 1px}
       #tb21-auto-panel .ap-card-val.ok{color:#34d399}
@@ -1402,7 +1832,9 @@
     });
 
     updateAutoPanel(panel, panel.__tb21ExtraInfo);
+    renderFleetDashboard();
     setInterval(function () { updateAutoPanel(panel, panel.__tb21ExtraInfo); }, 2000);
+    setInterval(function () { renderFleetDashboard(); }, 1000);
     return panel;
   }
   function updateAutoPanel(panel, extraInfo) {
@@ -2613,6 +3045,88 @@
       const infoText = info ? info.textContent : '';
       return card.textContent.replace(infoText, '').trim().replace(/\s+/g, ' ').slice(0, 50);
     }
+    /* ---------- 🚀 纯后台静默舰队看板组件 ---------- */
+    function renderFleetDashboard() {
+      const panel = cachedEl('tb21-auto-panel');
+      if (!panel) return;
+      const body = panel.querySelector('.ap-body');
+      if (!body) return;
+      let fleetBox = body.querySelector('.ap-fleet-box');
+      if (!fleetBox) {
+        fleetBox = document.createElement('div');
+        fleetBox.className = 'ap-fleet-box';
+        const infoEl = body.querySelector('.ap-info');
+        if (infoEl) body.insertBefore(fleetBox, infoEl);
+        else body.appendChild(fleetBox);
+      }
+
+      const isFleetActive = HeadlessFleetManager.isFleetRunning();
+      const conc = HeadlessFleetManager.getConcurrency();
+      const workers = HeadlessFleetManager.getActiveWorkersStatus();
+      const qCount = HeadlessFleetManager.getQueueCount();
+      const cCount = HeadlessFleetManager.getCompletedCount();
+
+      let cardsHtml = '';
+      if (!isFleetActive) {
+        cardsHtml = '<div class="ap-fleet-empty">静默舰队未启动（勾选开启0%CPU多课并发）</div>';
+      } else if (workers.length === 0) {
+        cardsHtml = '<div class="ap-fleet-empty">' + (qCount > 0 ? ('正在调度队列中 ' + qCount + ' 门课程...') : '队列暂无待刷课程') + '</div>';
+      } else {
+        workers.forEach(function (w) {
+          cardsHtml +=
+            '<div class="ap-fleet-card">' +
+              '<div class="ap-fleet-card-title">' +
+                '<span class="ap-fleet-cname" title="' + w.courseTitle + '">' + w.courseTitle + '</span>' +
+                '<span class="ap-fleet-time">⏱️ ' + w.remainText + '</span>' +
+              '</div>' +
+              '<div class="ap-fleet-card-sub">' +
+                '<span>' + (w.totalSections > 0 ? ('第' + w.sectionIndex + '/' + w.totalSections + '节: ' + w.sectionName) : '准备中') + '</span>' +
+                '<span>' + w.percent + '%</span>' +
+              '</div>' +
+              '<div class="ap-fleet-track">' +
+                '<div class="ap-fleet-bar" style="width:' + w.percent + '%"></div>' +
+              '</div>' +
+            '</div>';
+        });
+      }
+
+      fleetBox.innerHTML =
+        '<div class="ap-fleet-header">' +
+          '<label class="ap-fleet-label" title="开启后无需打开播放页，全部在当前标签页纯后台0%CPU静默多课并发刷课">' +
+            '<input type="checkbox" id="tb21-headless-toggle"' + (isFleetActive ? ' checked' : '') + '>' +
+            '<span>🚀 纯后台静默舰队</span>' +
+          '</label>' +
+          '<div class="ap-fleet-conc-btns">' +
+            '<button class="ap-conc-btn' + (conc === 2 ? ' active' : '') + '" data-conc="2" title="并发2门">2</button>' +
+            '<button class="ap-conc-btn' + (conc === 3 ? ' active' : '') + '" data-conc="3" title="并发3门(推荐)">3</button>' +
+            '<button class="ap-conc-btn' + (conc === 5 ? ' active' : '') + '" data-conc="5" title="并发5门">5</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="ap-fleet-list">' + cardsHtml + '</div>' +
+        (isFleetActive ? ('<div style="font-size:10px;color:#64748b;margin-top:4px;display:flex;justify-content:space-between;"><span>已结课: ' + cCount + ' 门</span><span>排队中: ' + qCount + ' 门</span></div>') : '');
+
+      const toggle = fleetBox.querySelector('#tb21-headless-toggle');
+      if (toggle) {
+        toggle.addEventListener('change', function () {
+          if (toggle.checked) {
+            HeadlessFleetManager.start();
+          } else {
+            HeadlessFleetManager.stop();
+          }
+          renderFleetDashboard();
+        });
+      }
+
+      fleetBox.querySelectorAll('.ap-conc-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          const c = parseInt(btn.dataset.conc, 10);
+          HeadlessFleetManager.setConcurrency(c);
+          renderFleetDashboard();
+        });
+      });
+    }
+    HeadlessFleetManager.onUpdate(renderFleetDashboard);
+
     function buildCourseList() {
       const panel = cachedEl('tb21-auto-panel');
       if (!panel) return;
@@ -2818,6 +3332,29 @@
 
     routeInterval(function () {
       if (!isAutoRunning()) { stage = 0; exhaustedTabs = {}; return; }
+
+      // 🚀 纯后台静默舰队优先调度：若静默挂机开启，自动搜集计划内未完成课程加入舰队，全权由后台接管！
+      if (HeadlessFleetManager.isFleetRunning()) {
+        const allCards = getVisibleCards();
+        const credit = readCategoryRequirement();
+        const plan = computeOptimalCoursePlan(allCards, credit);
+        const plannedCourses = plan.planReq.concat(plan.planEle).filter(function (c) { return !c.done; });
+
+        const fleetCourses = [];
+        plannedCourses.forEach(function (c) {
+          const cid = getCardCourseId(c.card);
+          if (cid) {
+            fleetCourses.push({
+              courseId: cid,
+              title: c.title,
+              sourceId: '',
+              providerCorpCode: ''
+            });
+          }
+        });
+        HeadlessFleetManager.setCourses(fleetCourses);
+        return; // 不点击任何卡片，防止弹窗打扰！
+      }
       if (location.hash.indexOf('courseDetail') === -1) { stage = 0; exhaustedTabs = {}; return; } // 路由守卫
       if (Date.now() < clickLock) return; // 导航锁生效中
 
