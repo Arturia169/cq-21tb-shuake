@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.12.7
+// @version      1.12.8
 // @description  在线课程学习辅助（21tb / 重庆公需课）：倍速播放（2x~16x）、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -30,6 +30,14 @@
             if (window.__tb21_godmode_ready) return;
             window.__tb21_godmode_ready = true;
             console.log('[刷课助手-破解] 🚀 上帝模式与防封护盾已启动...');
+
+            // 0.00 注入防护样式，永久抹杀 50% 时长不足导致的“画面变灰/重新观看”遮罩
+            try {
+              const shieldStyle = document.createElement('style');
+              shieldStyle.id = 'tb21-shield-style';
+              shieldStyle.textContent = '.player-endInfo.has-replay-btn, .player-replay-tip, .replay-btn, .has-replay-btn { display: none !important; visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; }';
+              (document.head || document.documentElement).appendChild(shieldStyle);
+            } catch(e) {}
 
             // 0. 拦截原生 alert 和 confirm，防止平台报“异常/快进”弹窗打断播放
             try {
@@ -186,11 +194,29 @@
                     const reqObj = JSON.parse(reqData);
                     if (reqObj && reqObj.studyLogVO) {
                       reqObj.studyLogVO.minStudyTime = 0;
-                      // 防风控核心：防止脉冲步进导致单次累加秒数过大引发后端判定“异常”
                       if (reqObj.studyLogVO.studyTime && reqObj.studyLogVO.studyTime > 45) {
                         reqObj.studyLogVO.studyTime = 30;
                       }
                       reqData = JSON.stringify(reqObj);
+                    }
+                  }
+                } catch (e) {}
+              }
+
+              // 核心突破：拦截 updateCourseRecord 上报请求，绝不允许因为 recordTime < 50% 将进度截断为几十秒！
+              if (url.indexOf('updateCourseRecord') > -1) {
+                try {
+                  if (typeof reqData === 'string') {
+                    const reqObj = JSON.parse(reqData);
+                    if (reqObj && reqObj.timeToFinish) {
+                      const v = document.querySelector('video');
+                      const isFinishing = (v && (v.ended || (v.duration && v.currentTime >= v.duration - 5))) || window.__tb21_rush_finishing;
+                      if (isFinishing || reqObj.currentPosition >= reqObj.timeToFinish - 10) {
+                        reqObj.currentPosition = reqObj.timeToFinish;
+                        reqObj.currentStudyTime = Math.max(reqObj.currentStudyTime || 0, Math.round(reqObj.timeToFinish * 0.6));
+                        reqData = JSON.stringify(reqObj);
+                        console.log('[刷课助手-护盾] 🎯 成功重写 updateCourseRecord(XHR) 为100%完播，破除50%截断:', reqObj.currentPosition);
+                      }
                     }
                   }
                 } catch (e) {}
@@ -288,6 +314,24 @@
                         reqObj.studyLogVO.studyTime = 30;
                       }
                       args[1].body = JSON.stringify(reqObj);
+                    }
+                  }
+                } catch (e) {}
+              }
+
+              if (fetchUrl.indexOf('updateCourseRecord') > -1 && reqData) {
+                try {
+                  if (typeof reqData === 'string') {
+                    const reqObj = JSON.parse(reqData);
+                    if (reqObj && reqObj.timeToFinish) {
+                      const v = document.querySelector('video');
+                      const isFinishing = (v && (v.ended || (v.duration && v.currentTime >= v.duration - 5))) || window.__tb21_rush_finishing;
+                      if (isFinishing || reqObj.currentPosition >= reqObj.timeToFinish - 10) {
+                        reqObj.currentPosition = reqObj.timeToFinish;
+                        reqObj.currentStudyTime = Math.max(reqObj.currentStudyTime || 0, Math.round(reqObj.timeToFinish * 0.6));
+                        args[1].body = JSON.stringify(reqObj);
+                        console.log('[刷课助手-护盾] 🎯 成功重写 updateCourseRecord(Fetch) 为100%完播，破除50%截断:', reqObj.currentPosition);
+                      }
                     }
                   }
                 } catch (e) {}
@@ -2753,7 +2797,7 @@
       iframeFastKiller.observe(document.documentElement || document.body, { childList: true, subtree: true });
     } catch(e) {}
 
-    // [Vue 播放器属性强制解锁] 遍历 Vue 播放器组件，把 allowDrag / allowHighSpeed 设为 true，关闭 preventCheatFlag
+    // [Vue 播放器属性强制解锁] 遍历 Vue 播放器组件，把 allowDrag / allowHighSpeed 设为 true，关闭 preventCheatFlag，伪装 recordTime 杜绝 50% 限制
     function unlockVuePlayerInstance() {
       try {
         const rootEl = document.getElementById('app');
@@ -2762,9 +2806,18 @@
           if (!vm) return;
           if ('allowDrag' in vm) vm.allowDrag = true;
           if ('allowHighSpeed' in vm) vm.allowHighSpeed = true;
+          if ('allowMinStudyTime' in vm) vm.allowMinStudyTime = true;
           if ('preventCheatFlag' in vm) vm.preventCheatFlag = false;
           if ('hangUpFlag' in vm) vm.hangUpFlag = false;
           if ('mustReplayCanFinish' in vm) vm.mustReplayCanFinish = false;
+          if ('isEdge' in vm) vm.isEdge = false;
+          if ('isIE11' in vm) vm.isIE11 = false;
+          // 核心绝杀：强行将 recordTime 伪装到 noPreviewCurTimeToFinish (50%) 以上，破除“画面变灰+重新观看”判定！
+          if ('recordTime' in vm && 'noPreviewCurTimeToFinish' in vm) {
+            if (vm.recordTime < vm.noPreviewCurTimeToFinish + 10) {
+              vm.recordTime = vm.noPreviewCurTimeToFinish + 10;
+            }
+          }
           if (vm.$children && vm.$children.length) {
             vm.$children.forEach(unlockComponent);
           }
@@ -3856,6 +3909,21 @@
             rushTimer = null;
             const finishTime = Math.max(0, dur - 0.3);
             v.currentTime = finishTime;
+            window.__tb21_rush_finishing = true;
+            setTimeout(function() { window.__tb21_rush_finishing = false; }, 6000);
+            try {
+              const rootEl = document.getElementById('app');
+              if (rootEl && rootEl.__vue__) {
+                function syncFinish(vm) {
+                  if (!vm) return;
+                  if ('seek' in vm) vm.seek = dur;
+                  if ('recordTime' in vm) vm.recordTime = dur;
+                  if ('mustReplayCanFinish' in vm) vm.mustReplayCanFinish = false;
+                  if (vm.$children) vm.$children.forEach(syncFinish);
+                }
+                syncFinish(rootEl.__vue__);
+              }
+            } catch(e) {}
             triggerStudyLogReport(v);
             console.log('[刷课助手] 🚀 极速冲刺尾帧打点完成，触发自然完播与闪电切节！');
             
