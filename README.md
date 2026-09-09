@@ -1,7 +1,7 @@
 # ⚡ 重庆专技公需课（21tb）全自动刷课助手
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.12.5-blue.svg?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.12.6-blue.svg?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/platform-Tampermonkey%20%7C%20Violentmonkey-green.svg?style=flat-square" alt="Platform">
   <img src="https://img.shields.io/badge/support-Chrome%20%7C%20Edge%20%7C%20Safari%20%7C%20Firefox-orange.svg?style=flat-square" alt="Browsers">
   <img src="https://img.shields.io/badge/license-MIT-lightgrey.svg?style=flat-square" alt="License">

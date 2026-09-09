@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.12.5
+// @version      1.12.6
 // @description  在线课程学习辅助（21tb / 重庆公需课）：倍速播放（2x~16x）、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -31,6 +31,39 @@
             window.__tb21_godmode_ready = true;
             console.log('[刷课助手-破解] 🚀 上帝模式与防封护盾已启动...');
 
+            // 0. 拦截原生 alert 和 confirm，防止平台报“异常/快进”弹窗打断播放
+            try {
+              window.alert = function(msg) {
+                console.log('[刷课助手-护盾] 🛡️ 成功拦截并静默平台 alert 弹窗:', msg);
+                return true;
+              };
+              window.confirm = function(msg) {
+                console.log('[刷课助手-护盾] 🛡️ 成功拦截并静默平台 confirm 弹窗:', msg);
+                return true;
+              };
+            } catch(e) {}
+
+            // 0.1 核心底层防御：在页面真实主上下文劫持 currentTime，坚决拦截平台尝试拉回/重置进度（包括拉回到0）
+            try {
+              const origTimeDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
+              if (origTimeDesc) {
+                Object.defineProperty(HTMLMediaElement.prototype, 'currentTime', {
+                  get: function() { return origTimeDesc.get.call(this); },
+                  set: function(val) {
+                    const cur = origTimeDesc.get.call(this);
+                    // 核心拦截：如果当前进度已经 > 3 秒，且目标时间比当前时间小超过 2 秒（包括被平台强行归零）
+                    // 只要不是正在正常切小节/切课程，坚决拒绝！
+                    if (cur > 3 && (cur - val) > 2 && !window.__tb21_switching_section) {
+                      console.log('[刷课助手-护盾] 🛡️ 坚决拦截平台/弹窗尝试强制拉回进度！原时间:', cur.toFixed(1), '目标时间:', val);
+                      return; // 拒绝修改，保持当前进度！
+                    }
+                    return origTimeDesc.set.call(this, val);
+                  }
+                });
+                console.log('[刷课助手-护盾] 🛡️ 页面真实上下文进度防拉回锁定已激活');
+              }
+            } catch(e) {}
+
             // 1. 拦截并篡改 XHR
             const rawOpen = XMLHttpRequest.prototype.open;
             const rawSend = XMLHttpRequest.prototype.send;
@@ -59,13 +92,17 @@
               let modifiedResponse = null;
               let reqData = data;
 
-              // 篡改 saveStudyLog.do 请求，强制将上报的 minStudyTime 归零
+              // 篡改 saveStudyLog.do 请求，强制 minStudyTime 归零，并平滑化 studyTime 防止后端风控拦截
               if (url.indexOf('saveStudyLog.do') > -1) {
                 try {
                   if (typeof reqData === 'string') {
                     const reqObj = JSON.parse(reqData);
                     if (reqObj && reqObj.studyLogVO) {
                       reqObj.studyLogVO.minStudyTime = 0;
+                      // 防风控核心：防止脉冲步进导致单次累加秒数过大引发后端判定“异常”
+                      if (reqObj.studyLogVO.studyTime && reqObj.studyLogVO.studyTime > 45) {
+                        reqObj.studyLogVO.studyTime = 30;
+                      }
                       reqData = JSON.stringify(reqObj);
                     }
                   }
@@ -154,6 +191,9 @@
                     const reqObj = JSON.parse(reqData);
                     if (reqObj && reqObj.studyLogVO) {
                       reqObj.studyLogVO.minStudyTime = 0;
+                      if (reqObj.studyLogVO.studyTime && reqObj.studyLogVO.studyTime > 45) {
+                        reqObj.studyLogVO.studyTime = 30;
+                      }
                       args[1].body = JSON.stringify(reqObj);
                     }
                   }
@@ -402,7 +442,7 @@
   }
 
   /* ============ 公共：自动关闭弹窗（Element UI + 通用检测） ============ */
-  const ANOMALY_KEYWORDS = ['学习行为', '学霸君', '存在异常', '行为异常', '系统检测', '学习异常'];
+  const ANOMALY_KEYWORDS = ['学习行为', '学霸君', '存在异常', '行为异常', '系统检测', '学习异常', '播放速度', '快进', '拖拽', '重置', '失败', '异常', '警告', '提示'];
   const SKIP_KEYWORDS = ['作弊', '违规', '风控', '答题', '验证', '超时', '登录'];
 
   function autoDismissMessageBox() {
@@ -2627,14 +2667,14 @@
           },
           set: function (val) {
             const current = originalTimeDesc.get.call(this);
-            // 拦截条件：目标时间 > 1秒 (排除切视频重置为0) 且 比当前时间小超过 3 秒
-            if (val > 1 && val < current && (current - val) > 3) {
-              // 减少日志刷屏频率，用防抖或条件控制
-              if (!this._lastInterceptLog || Date.now() - this._lastInterceptLog > 5000) {
-                console.log('[刷课助手] 🛡️ 拦截到平台尝试拉回进度！原时间:', current.toFixed(1), '目标时间:', val.toFixed(1));
+            // 拦截条件：只要已播超过 3 秒，且目标时间比当前时间小超过 2 秒（包括被平台强行归零）
+            // 只要不是正在正常切小节/切课程，坚决拒绝倒退与归零！
+            if (current > 3 && (current - val) > 2 && !window.__tb21_switching_section) {
+              if (!this._lastInterceptLog || Date.now() - this._lastInterceptLog > 3000) {
+                console.log('[刷课助手] 🛡️ 坚决拦截平台尝试拉回/重置进度！原时间:', current.toFixed(1), '目标时间:', val.toFixed(1));
                 this._lastInterceptLog = Date.now();
               }
-              return; // 拒绝修改，防止倒退
+              return; // 拒绝修改，防止倒退与清零！
             }
             originalTimeDesc.set.call(this, val);
           }
@@ -3107,6 +3147,8 @@
       }
 
       if (isNew) {
+        window.__tb21_switching_section = true;
+        setTimeout(function() { window.__tb21_switching_section = false; }, 3000);
         lastVideoEl = v;
         if (currentSrc) lastVideoSrc = currentSrc;
         clearNextTimers(); // 清除排队的切节定时器，防止跨视频跳课
@@ -3588,8 +3630,9 @@
 
           const dur = v.duration;
           const cur = v.currentTime;
-          // 全视频分为 6 个脉冲区间，步长约 16.5%
-          const step = Math.max(12, dur * 0.165);
+          // [平滑防风控算法] 单次步进控制在 35~55 秒（合规容差范围），每 1.8 秒推进一次，整门课约 40~50 秒闪电通关
+          // 彻底消除由于单次跳跃过大导致的后端“播放过快/学习异常”风控弹窗！
+          const step = Math.min(55, Math.max(25, dur * 0.05));
           const nextTime = cur + step;
 
           if (nextTime < dur - 2.5) {
@@ -3597,7 +3640,7 @@
             triggerStudyLogReport(v);
             rushStepCount++;
             const pct = Math.round((nextTime / dur) * 100);
-            console.log('[刷课助手] 🚀 极速冲刺脉冲 #' + rushStepCount + ': 推进至 ' + nextTime.toFixed(1) + 's / ' + dur.toFixed(1) + 's (' + pct + '%)');
+            console.log('[刷课助手] 🚀 极速冲刺平滑脉冲 #' + rushStepCount + ': 推进至 ' + nextTime.toFixed(1) + 's / ' + dur.toFixed(1) + 's (' + pct + '%)');
           } else {
             // 阶段 3：尾帧收官完播，立即闪电切换下一节
             clearInterval(rushTimer);
@@ -3628,7 +3671,7 @@
               tryNext();
             }, 400);
           }
-        }, 2200); // 每 2.2 秒脉冲推进一次，15~18 秒通关
+        }, 1800); // 每 1.8 秒平滑步进一次，稳定通关且不触发风控
       }
     }
 
