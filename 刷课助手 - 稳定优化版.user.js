@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.15.2
+// @version      1.15.3
 // @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://testingcf.jsdelivr.net/gh/Arturia169/cq-21tb-shuake@main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -30,6 +30,39 @@
             if (window.__tb21_godmode_ready) return;
             window.__tb21_godmode_ready = true;
             console.log('[刷课助手-破解] 🚀 上帝模式与防封护盾已启动...');
+
+            // 0.000 穿透 DOM 隔离：实时为课程卡片注入真实 courseId 与元数据 (主上下文无阻穿透)
+            try {
+              const stampCourses = function() {
+                const cards = document.querySelectorAll('.text-item.cursor');
+                const list = [];
+                cards.forEach(function(card) {
+                  try {
+                    let ci = null;
+                    if (card.__vue__ && card.__vue__.courseInfo) {
+                      ci = card.__vue__.courseInfo;
+                    } else if (card.parentElement && card.parentElement.__vue__ && card.parentElement.__vue__.courseInfo) {
+                      ci = card.parentElement.__vue__.courseInfo;
+                    }
+                    if (ci && ci.courseId) {
+                      const cid = String(ci.courseId);
+                      card.setAttribute('data-course-id', cid);
+                      if (ci.courseTitle) card.setAttribute('data-course-title', ci.courseTitle);
+                      if (ci.courseScore) card.setAttribute('data-course-score', String(ci.courseScore));
+                      const text = card.textContent || '';
+                      const isDone = text.indexOf('已完成') > -1 || (card.__vue__ && (card.__vue__.schedule >= 100 || card.__vue__.status === 2));
+                      card.setAttribute('data-course-done', isDone ? '1' : '0');
+                      list.push({ courseId: cid, title: ci.courseTitle || '', done: isDone });
+                    }
+                  } catch(e) {}
+                });
+                if (list.length > 0) {
+                  try { sessionStorage.setItem('tb21_dom_courses', JSON.stringify(list)); } catch(e) {}
+                }
+              };
+              stampCourses();
+              setInterval(stampCourses, 800);
+            } catch(e) {}
 
             // 0.00 注入防护样式，永久抹杀 50% 时长不足导致的“画面变灰/重新观看”遮罩与 Element UI 网页变暗背景 (v-modal)
             try {
@@ -951,6 +984,77 @@
       return await get('/nms/html/courseStudy/loadCoursePage.do', params);
     }
 
+    // 4.1 官方全量未完成课程精准直连拉取 (优先用于静默舰队与智能规划)
+    async function fetchDetailCourses(projectId) {
+      if (!projectId) return [];
+      try {
+        const stageRes = await get('/nms/html/courseStudy/getRmStageByProjectId.do', { projectId: projectId });
+        const stages = (stageRes && Array.isArray(stageRes)) ? stageRes : [{}];
+        const resList = [];
+        for (let i = 0; i < stages.length; i++) {
+          const sId = stages[i] ? stages[i].stageId : '';
+          const [mustRes, eleRes] = await Promise.all([
+            get('/nms/html/courseStudy/getCourseDetailByProjectId.do', {
+              projectId: projectId,
+              stageId: sId,
+              courseType: 'MUST',
+              courseStatus: 'NOT_COMPLETE',
+              pageNo: 1,
+              pageSize: 100
+            }).catch(function () { return null; }),
+            get('/nms/html/courseStudy/getCourseDetailByProjectId.do', {
+              projectId: projectId,
+              stageId: sId,
+              courseType: 'SELECTIVE',
+              courseStatus: 'NOT_COMPLETE',
+              pageNo: 1,
+              pageSize: 100
+            }).catch(function () { return null; })
+          ]);
+          const mRows = (mustRes && mustRes.rows) || [];
+          const eRows = (eleRes && eleRes.rows) || [];
+          mRows.concat(eRows).forEach(function (row) {
+            if (row && row.courseInfo && row.courseInfo.courseId) {
+              const cid = String(row.courseInfo.courseId);
+              if (!resList.some(function (x) { return x.courseId === cid; })) {
+                resList.push({
+                  courseId: cid,
+                  title: row.courseInfo.courseTitle || ('课程_' + cid),
+                  score: row.courseInfo.courseScore || 0,
+                  sourceId: '',
+                  providerCorpCode: ''
+                });
+              }
+            }
+          });
+        }
+        if (resList.length > 0) return resList;
+
+        // 备用降级: loadCoursePage.do
+        const pageRes = await loadAllCourses(projectId, '', '');
+        if (pageRes && pageRes.rows && Array.isArray(pageRes.rows)) {
+          pageRes.rows.forEach(function (r) {
+            const cid = String(r.courseId || (r.courseInfo && r.courseInfo.courseId) || '');
+            const text = r.courseSchedule || r.currentStepRate || '';
+            const isDone = String(text).indexOf('100') > -1 || r.status === 2;
+            if (cid && !isDone && !resList.some(function (x) { return x.courseId === cid; })) {
+              resList.push({
+                courseId: cid,
+                title: r.courseName || r.courseTitle || (r.courseInfo && r.courseInfo.courseTitle) || ('课程_' + cid),
+                score: r.score || r.courseScore || 0,
+                sourceId: '',
+                providerCorpCode: ''
+              });
+            }
+          });
+        }
+        return resList;
+      } catch (err) {
+        console.warn('[刷课助手-API] 拉取未完成课程异常:', err);
+        return [];
+      }
+    }
+
     // 5. 结业考试准考资格检测
     async function checkExamAvailable(currentStageId) {
       if (!currentStageId) return null;
@@ -1009,6 +1113,7 @@
       getStageRequirements: getStageRequirements,
       getProjectDetail: getProjectDetail,
       loadAllCourses: loadAllCourses,
+      fetchDetailCourses: fetchDetailCourses,
       checkExamAvailable: checkExamAvailable,
       fetchUserCertificates: fetchUserCertificates,
       fetchCourseChapterMeta: fetchCourseChapterMeta
@@ -1175,7 +1280,10 @@
         notifyStatus();
 
         // 1. 获取小节列表
-        const chapData = await TbApiClient.post('/tbc-rms/course/showCourseChapter', { courseId: courseId });
+        let chapData = await TbApiClient.post('/tbc-rms/course/showCourseChapter', { courseId: courseId });
+        if (!chapData || !chapData.bizResult || !Array.isArray(chapData.bizResult)) {
+          chapData = await TbApiClient.get('/tbc-rms/course/showCourseChapter', { courseId: courseId });
+        }
         if (!chapData || !chapData.bizResult || !Array.isArray(chapData.bizResult)) {
           state = 'ERROR';
           notifyStatus();
@@ -1645,39 +1753,75 @@
   /* ---------- 🚀 纯后台静默舰队看板组件 (顶级通用组件) ---------- */
   
   /* ---------- 🚀 静默舰队即时全景抓取与任务派发 ---------- */
-  function scanAndDispatchFleet() {
+  async function scanAndDispatchFleet() {
     const isDetail = location.hash.indexOf('courseDetail') > -1 || location.href.indexOf('courseDetail') > -1;
     const isList = location.hash.indexOf('course/list') > -1 || location.href.indexOf('course/list') > -1;
 
     if (isDetail) {
-      const cards = document.querySelectorAll('.text-item.cursor, .course-item, .box-card');
-      const fleetCourses = [];
-      cards.forEach(function (c) {
-        const text = c.textContent || '';
-        if (text.indexOf('已完成') > -1) return;
-        try {
-          if (c.__vue__ && c.__vue__.courseInfo) {
-            const ci = c.__vue__.courseInfo;
-            if (ci.status === 2 || ci.schedule >= 100) return;
+      let fleetCourses = [];
+
+      // 策略 A: 从主页面上下文穿透写入的 sessionStorage 提取
+      try {
+        const domStr = sessionStorage.getItem('tb21_dom_courses');
+        if (domStr) {
+          const domList = JSON.parse(domStr);
+          if (Array.isArray(domList)) {
+            domList.forEach(function (c) {
+              if (!c.done && c.courseId) {
+                fleetCourses.push({
+                  courseId: String(c.courseId),
+                  title: c.title || ('课程_' + c.courseId),
+                  sourceId: '',
+                  providerCorpCode: ''
+                });
+              }
+            });
           }
-        } catch (e) {}
-        const cid = getCardCourseId(c);
-        if (!cid) return;
-        const titleEl = c.querySelector('.text-title, .title, .course-name, h4, h3');
-        const title = titleEl ? titleEl.textContent.trim() : ('课程_' + cid);
-        fleetCourses.push({
-          courseId: cid,
-          title: title,
-          sourceId: '',
-          providerCorpCode: ''
+        }
+      } catch (e) {}
+
+      // 策略 B: 从已被主上下文注入 data-course-id 的 DOM 卡片直接扫描
+      if (fleetCourses.length === 0) {
+        const cards = document.querySelectorAll('.text-item.cursor, .course-item, .box-card');
+        cards.forEach(function (c) {
+          const text = c.textContent || '';
+          if (text.indexOf('已完成') > -1 || c.getAttribute('data-course-done') === '1') return;
+          const cid = getCardCourseId(c);
+          if (!cid) return;
+          const titleEl = c.querySelector('.text-title, .title, .course-name, h4, h3, .item__name');
+          const title = c.getAttribute('data-course-title') || (titleEl ? titleEl.textContent.trim() : ('课程_' + cid));
+          if (!fleetCourses.some(function (x) { return x.courseId === cid; })) {
+            fleetCourses.push({
+              courseId: cid,
+              title: title,
+              sourceId: '',
+              providerCorpCode: ''
+            });
+          }
         });
-      });
+      }
+
+      // 策略 C: 终极杀手锏——官方接口全量拉取当前项目所有未完成课程 (100%覆盖、零漏单)
+      if (fleetCourses.length === 0) {
+        const params = getRouteQueryParams();
+        const projectId = params.projectId || '';
+        if (projectId) {
+          console.log('[刷课助手-静默舰队] 📡 正在通过官方接口全量同步当前项目未学课程 (projectId: ' + projectId + ')...');
+          try {
+            const apiCourses = await TbApiClient.fetchDetailCourses(projectId);
+            if (apiCourses && apiCourses.length > 0) {
+              fleetCourses = apiCourses;
+              console.log('[刷课助手-静默舰队] 🏆 官方接口成功捕获未学课程共 ' + apiCourses.length + ' 门！');
+            }
+          } catch (e) {}
+        }
+      }
 
       if (fleetCourses.length > 0) {
         HeadlessFleetManager.setCourses(fleetCourses);
-        console.log('[刷课助手-静默舰队] 🎯 立即就地捕获待学课程 ' + fleetCourses.length + ' 门加入静默并发队列！');
+        console.log('[刷课助手-静默舰队] 🎯 静默舰队成功装载 ' + fleetCourses.length + ' 门待刷课程，并发调度起跑！');
       } else {
-        console.log('[刷课助手-静默舰队] ℹ️ 当前页面卡片暂未完全载入或已全部学完，静默后台保持待命');
+        console.log('[刷课助手-静默舰队] ℹ️ 当前页面卡片暂未完全载入或已全部学完，保持待命监听');
       }
     } else if (isList) {
       console.log('[刷课助手-静默舰队] 🎯 列表页触发静默舰队，自动进入目标年度攻坚...');
@@ -1686,6 +1830,7 @@
         enterBtns[0].click();
       }
     }
+    renderFleetDashboard();
   }
 
   function renderFleetDashboard() {
@@ -3434,6 +3579,10 @@
 
       // 🚀 纯后台静默舰队优先调度：若静默挂机开启，自动搜集计划内未完成课程加入舰队，全权由后台接管！
       if (isFleet) {
+        if (HeadlessFleetManager.getQueueCount() === 0 && HeadlessFleetManager.getActiveWorkersStatus().length === 0) {
+          scanAndDispatchFleet();
+          return;
+        }
         const allCards = getVisibleCards();
         const credit = readCategoryRequirement();
         const plan = computeOptimalCoursePlan(allCards, credit);
