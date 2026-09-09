@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.12.8
+// @version      1.13.0
 // @description  在线课程学习辅助（21tb / 重庆公需课）：倍速播放（2x~16x）、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://raw.githubusercontent.com/Arturia169/cq-21tb-shuake/main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -3771,40 +3771,78 @@
       }
       publishFallback();
 
-      // 状态行
+      // 状态行（body 内）
       const st = panel.querySelector('.th-status');
-      if (st) {
-        const v = getVideo();
-        let txt = '';
-        if (S.rushMode) {
-          txt = '🚀 极速冲刺中 · ' + (S.autoMute ? '静音' : '有声') + ' · ' + (S.autoNext ? '自动' : '手动');
-        } else {
-          txt = S.speed + 'x' + ' · ' + (S.autoMute ? '静音' : '有声') + ' · ' + (S.autoNext ? '自动' : '手动');
-        }
-        if (quizOpen) txt += ' · ⚠答题验证';
-        else if (userPaused) txt += ' · 已暂停(手动)';
-        else if (Date.now() < softStartUntil) txt += ' · 1x缓冲';
-        else if (rampUpTimer) txt += ' · 渐进提速';
-        else if (v && !v.paused) txt += ' · 播放中';
-        else if (v && v.paused) txt += ' · 已暂停';
-        if (st.textContent !== txt) st.textContent = txt;
+      const v2 = getVideo();
+      let statusTxt = '';
+      let stateLabel = '';
+      let stateColor = '#10b981';
+      if (S.rushMode) {
+        statusTxt = '🚀 极速冲刺中 · ' + (S.autoMute ? '静音' : '有声') + ' · ' + (S.autoNext ? '自动' : '手动');
+        stateLabel = '🚀 冲刺中';
+      } else {
+        statusTxt = S.speed + 'x' + ' · ' + (S.autoMute ? '静音' : '有声') + ' · ' + (S.autoNext ? '自动' : '手动');
+        stateLabel = S.speed + 'x';
+      }
+      if (quizOpen) {
+        statusTxt += ' · ⚠答题验证'; stateLabel = '⚠ 答题验证'; stateColor = '#ef4444';
+      } else if (userPaused) {
+        statusTxt += ' · 已暂停(手动)'; stateLabel += ' · 已暂停'; stateColor = '#f59e0b';
+      } else if (Date.now() < softStartUntil) {
+        statusTxt += ' · 1x缓冲'; stateLabel += ' · 缓冲中'; stateColor = '#0ea5e9';
+      } else if (rampUpTimer) {
+        statusTxt += ' · 渐进提速'; stateLabel += ' · 提速中'; stateColor = '#0ea5e9';
+      } else if (v2 && !v2.paused) {
+        statusTxt += ' · 播放中'; stateLabel += ' · 播放中';
+      } else if (v2 && v2.paused) {
+        statusTxt += ' · 已暂停'; stateLabel += ' · 已暂停'; stateColor = '#f59e0b';
+      } else {
+        stateLabel += ' · 就绪'; stateColor = '#94a3b8';
+      }
+      if (st && st.textContent !== statusTxt) st.textContent = statusTxt;
 
-        const badge = panel.querySelector('.th-status-badge');
-        if (badge) {
-          if (quizOpen) {
-            badge.style.background = '#ef4444';
-            badge.style.boxShadow = '0 0 8px #ef4444';
-            badge.title = '⚠ 请答题验证';
-          } else if (v && !v.paused) {
-            badge.style.background = '#10b981';
-            badge.style.boxShadow = '0 0 8px #10b981';
-            badge.title = '播放中';
-          } else {
-            badge.style.background = '#f59e0b';
-            badge.style.boxShadow = '0 0 5px #f59e0b';
-            badge.title = '已暂停 / 缓冲';
-          }
+      // Header 状态指示灯颜色
+      const badge = panel.querySelector('.th-status-badge');
+      if (badge) {
+        if (badge.style.background !== stateColor) {
+          badge.style.background = stateColor;
+          badge.style.boxShadow = '0 0 8px ' + stateColor;
         }
+        const badgeTitle = quizOpen ? '⚠ 请答题验证' : (v2 && !v2.paused ? '播放中' : '已暂停 / 缓冲');
+        if (badge.title !== badgeTitle) badge.title = badgeTitle;
+      }
+
+      // 状态芯片（Header 下方的紧凑状态条）
+      const chipTxt = panel.querySelector('.th-chip-txt');
+      if (chipTxt && chipTxt.textContent !== stateLabel) chipTxt.textContent = stateLabel;
+      const chipDot = panel.querySelector('.th-chip-dot');
+      if (chipDot && chipDot.style.background !== stateColor) {
+        chipDot.style.background = stateColor;
+        chipDot.style.boxShadow = '0 0 6px ' + stateColor;
+      }
+
+      // 折叠态信息同步（倍速 + 进度百分比）
+      const collSpd = panel.querySelector('.th-collapsed-spd');
+      if (collSpd) {
+        const spdTxt = S.rushMode ? '🚀' : (S.speed + 'x');
+        if (collSpd.textContent !== spdTxt) collSpd.textContent = spdTxt;
+      }
+      const collPct = panel.querySelector('.th-collapsed-pct');
+      if (collPct) {
+        const pctTxt = p ? (p.pct + '%') : '--%';
+        if (collPct.textContent !== pctTxt) collPct.textContent = pctTxt;
+      }
+
+      // 底部迷你进度条（永远可见的心跳线）
+      const miniFill = panel.querySelector('.th-mini-fill');
+      if (miniFill) {
+        let miniW = '0%';
+        if (v2 && v2.duration && v2.duration > 0 && isFinite(v2.duration)) {
+          miniW = Math.min(100, Math.round(v2.currentTime / v2.duration * 100)) + '%';
+        } else if (p) {
+          miniW = p.pct + '%';
+        }
+        if (miniFill.style.width !== miniW) miniFill.style.width = miniW;
       }
 
       // 警示行
@@ -4131,28 +4169,53 @@
       if (document.getElementById('tb21-panel')) return;
       const css = document.createElement('style');
       css.textContent = `
+        @keyframes ap-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.85)}}
+        @keyframes ap-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+        @keyframes ap-glow-warn{0%,100%{box-shadow:0 0 4px rgba(245,158,11,.3)}50%{box-shadow:0 0 12px rgba(245,158,11,.55)}}
         #tb21-panel{position:fixed;top:14px;right:14px;z-index:999999;width:310px;
-          background:rgba(15,23,42,.88);color:#f1f5f9;border-radius:14px;
+          background:rgba(15,23,42,.92);color:#f1f5f9;border-radius:14px;
           font:12px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
           box-shadow:0 16px 36px -6px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.1),inset 0 1px 0 rgba(255,255,255,.15);
-          backdrop-filter:blur(16px) saturate(180%);-webkit-backdrop-filter:blur(16px) saturate(180%);
-          user-select:none;overflow:hidden;transition:box-shadow .25s,width .25s cubic-bezier(.4,0,.2,1),border-radius .25s}
-        #tb21-panel.th-hide{width:auto;min-width:145px;border-radius:20px}
+          backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+          user-select:none;overflow:hidden;transition:box-shadow .3s,width .25s cubic-bezier(.4,0,.2,1),border-radius .25s,transform .2s ease}
+        #tb21-panel.th-dragging{box-shadow:0 20px 50px -8px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.15),inset 0 1px 0 rgba(255,255,255,.2);
+          transform:scale(1.02)}
+        #tb21-panel.th-hide{width:auto;min-width:auto;border-radius:20px}
         #tb21-panel.th-hide .th-head{padding:7px 12px;border-bottom:none;border-radius:20px}
-        #tb21-panel.th-hide .th-body{display:none}
+        #tb21-panel.th-hide .th-body{max-height:0;padding-top:0;padding-bottom:0;opacity:0;overflow:hidden}
         #tb21-panel.th-hide .th-fold{transform:rotate(-90deg)}
+        #tb21-panel.th-hide .th-status-chip{display:none}
+        #tb21-panel.th-hide .th-mini-bar{display:none}
+        #tb21-panel.th-hide .th-collapsed-info{display:inline-flex}
         #tb21-panel .th-head{display:flex;justify-content:space-between;align-items:center;
-          padding:9px 12px;background:rgba(255,255,255,.04);border-bottom:1px solid rgba(255,255,255,.06);
-          cursor:grab;font-weight:700;font-size:13px}
+          padding:9px 12px;background:rgba(255,255,255,.04);
+          border-bottom:1px solid rgba(255,255,255,.06);
+          cursor:grab;font-weight:700;font-size:13px;position:relative}
+        #tb21-panel .th-head::after{content:'';position:absolute;bottom:0;left:12px;right:12px;height:1px;
+          background:linear-gradient(90deg,transparent,rgba(14,165,233,.4),rgba(16,185,129,.4),transparent);
+          animation:ap-shimmer 4s linear infinite;background-size:200% 100%}
         #tb21-panel .th-head:active{cursor:grabbing}
         #tb21-panel .th-head-title{display:flex;align-items:center;gap:6px}
+        #tb21-panel .th-head-right{display:flex;align-items:center;gap:6px}
         #tb21-panel .th-logo{font-size:14px;filter:drop-shadow(0 0 4px rgba(245,158,11,.6))}
+        #tb21-panel .th-ver{font-size:9px;font-weight:500;color:#94a3b8;background:rgba(255,255,255,.08);padding:1px 6px;
+          border-radius:8px;border:1px solid rgba(255,255,255,.06);letter-spacing:.3px}
         #tb21-panel .th-status-badge{display:inline-block;width:7px;height:7px;border-radius:50%;margin-left:2px;
-          background:#10b981;box-shadow:0 0 8px #10b981;animation:ap-pulse 2s infinite;transition:all .3s}
+          background:#10b981;box-shadow:0 0 8px #10b981;animation:ap-pulse 2s ease-in-out infinite;transition:background .3s,box-shadow .3s}
+        #tb21-panel .th-collapsed-info{display:none;align-items:center;gap:4px;margin-left:4px;
+          font-size:10px;font-weight:500;color:#94a3b8}
+        #tb21-panel .th-collapsed-spd{color:#0ea5e9;font-weight:700}
+        #tb21-panel .th-collapsed-pct{color:#10b981;font-weight:600}
         #tb21-panel .th-fold{cursor:pointer;padding:2px 6px;color:#94a3b8;font-size:13px;border-radius:4px;
-          transition:transform .2s,color .2s,background .2s}
+          transition:transform .25s cubic-bezier(.4,0,.2,1),color .2s,background .2s}
         #tb21-panel .th-fold:hover{color:#f1f5f9;background:rgba(255,255,255,.08)}
-        #tb21-panel .th-body{padding:10px 12px 12px}
+        #tb21-panel .th-status-chip{display:flex;align-items:center;gap:5px;padding:4px 10px;margin:0;font-size:10px;
+          color:#94a3b8;background:rgba(255,255,255,.03);border-bottom:1px solid rgba(255,255,255,.05);
+          font-weight:500;letter-spacing:.2px}
+        #tb21-panel .th-status-chip .th-chip-dot{width:5px;height:5px;border-radius:50%;background:#10b981;
+          box-shadow:0 0 6px #10b981;animation:ap-pulse 2s ease-in-out infinite;flex-shrink:0}
+        #tb21-panel .th-body{padding:10px 12px 8px;max-height:800px;opacity:1;
+          transition:max-height .35s cubic-bezier(.4,0,.2,1),opacity .25s ease,padding .3s ease;overflow:hidden}
         #tb21-panel .th-row{margin:5px 0;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
         #tb21-panel .th-lab{color:#94a3b8;font-size:11px;font-weight:600}
         #tb21-panel .th-spd-row{display:flex;gap:6px;flex:1}
@@ -4163,7 +4226,9 @@
         #tb21-panel .th-spd:hover{background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.22);transform:translateY(-1px)}
         #tb21-panel .th-spd.on{background:linear-gradient(135deg,#0ea5e9,#2563eb);border-color:transparent;color:#fff;
           box-shadow:0 2px 8px rgba(14,165,233,.45)}
-        #tb21-panel .th-spd.warn{color:#f59e0b}
+        #tb21-panel .th-spd.warn{color:#f59e0b;border-color:rgba(245,158,11,.3);border-style:dashed}
+        #tb21-panel .th-spd.warn.on{background:linear-gradient(135deg,#f59e0b,#dc2626);border-style:solid;border-color:transparent;
+          animation:ap-glow-warn 2s ease-in-out infinite;color:#fff}
         #tb21-panel .th-spd-eta{font-size:10px;color:#94a3b8;line-height:1;font-family:monospace;white-space:nowrap}
         #tb21-panel .th-switch-row{display:flex;gap:10px;margin:8px 0 6px;flex-wrap:wrap}
         #tb21-panel .th-switch-label{display:inline-flex;align-items:center;gap:5px;cursor:pointer;font-size:11px;color:#cbd5e1;user-select:none}
@@ -4221,6 +4286,9 @@
         #tb21-panel .dh-done{color:#34d399;font-weight:600}
         #tb21-panel .th-status{color:#94a3b8;margin-top:8px;border-top:1px solid rgba(255,255,255,.08);padding-top:6px;font-size:11px}
         #tb21-panel .th-note{color:#fbbf24;font-size:11px;margin-top:4px;min-height:15px}
+        #tb21-panel .th-mini-bar{height:3px;background:rgba(255,255,255,.06);border-radius:0 0 14px 14px;overflow:hidden;margin-top:0}
+        #tb21-panel .th-mini-fill{height:100%;width:0;background:linear-gradient(90deg,#10b981,#06b6d4,#3b82f6);border-radius:0 0 14px 14px;
+          transition:width .5s ease-out}
         #tb21-panel ::-webkit-scrollbar{width:4px}
         #tb21-panel ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.18);border-radius:4px}
       `;
@@ -4230,13 +4298,16 @@
       panel.id = 'tb21-panel';
       panel.innerHTML =
         '<div class="th-head">' +
-          '<div class="th-head-title"><span class="th-logo">⚡</span><span>刷课助手</span><span class="th-status-badge running" title="播放中"></span></div>' +
-          '<span class="th-fold" title="收起/展开">▾</span>' +
+          '<div class="th-head-title"><span class="th-logo">⚡</span><span>刷课助手</span><span class="th-status-badge running" title="播放中"></span>' +
+            '<span class="th-collapsed-info"><span class="th-collapsed-spd">' + S.speed + 'x</span><span class="th-collapsed-pct">--%</span></span>' +
+          '</div>' +
+          '<div class="th-head-right"><span class="th-ver">v1.13.0</span><span class="th-fold" title="收起/展开">▾</span></div>' +
         '</div>' +
+        '<div class="th-status-chip"><span class="th-chip-dot"></span><span class="th-chip-txt">就绪</span></div>' +
         '<div class="th-body">' +
           '<div class="th-row th-speed-row"><span class="th-lab">倍速</span><span class="th-spd-row">' +
             SPEEDS.map(function (s) {
-              return '<span class="th-spd-wrap"><span class="th-spd' + (s > 16 ? ' warn' : '') + '" data-speed="' + s + '">' + s + 'x</span><span class="th-spd-eta">--</span></span>';
+              return '<span class="th-spd-wrap"><span class="th-spd' + (s >= 16 ? ' warn' : '') + '" data-speed="' + s + '">' + s + 'x</span><span class="th-spd-eta">--</span></span>';
             }).join('') +
           '</span></div>' +
           '<div class="th-row th-switch-row">' +
@@ -4251,7 +4322,8 @@
           '<div class="th-dash-list"></div>' +
           '<div class="th-status"></div>' +
           '<div class="th-note"></div>' +
-        '</div>';
+        '</div>' +
+        '<div class="th-mini-bar"><div class="th-mini-fill"></div></div>';
       (document.body || document.documentElement).appendChild(panel);
 
       // 拖动（记忆位置，rAF 平滑 + 边界防溢出）
@@ -4261,12 +4333,13 @@
       let curX = 0, curY = 0;
 
       head.addEventListener('mousedown', function (e) {
-        if (e.target.closest('.th-fold')) return;
+        if (e.target.closest('.th-fold') || e.target.closest('.th-ver')) return;
         const r = panel.getBoundingClientRect();
         drag = { dx: e.clientX - r.left, dy: e.clientY - r.top };
         curX = e.clientX;
         curY = e.clientY;
         document.body.style.userSelect = 'none';
+        panel.classList.add('th-dragging');
         e.preventDefault();
       });
 
@@ -4295,6 +4368,7 @@
         if (!drag) return;
         drag = null;
         document.body.style.userSelect = '';
+        panel.classList.remove('th-dragging');
         try {
           const r = panel.getBoundingClientRect();
           localStorage.setItem('tb21_helper_pos', JSON.stringify({ x: Math.round(r.left), y: Math.round(r.top) }));
