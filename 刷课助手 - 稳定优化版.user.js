@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.15.6
+// @version      1.15.7
 // @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://testingcf.jsdelivr.net/gh/Arturia169/cq-21tb-shuake@main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -89,6 +89,7 @@
                     if (item && item.courseInfo && item.courseInfo.courseId) {
                       card.setAttribute('data-course-id', String(item.courseInfo.courseId));
                       card.setAttribute('data-course-title', item.courseInfo.courseTitle || '');
+                      card.setAttribute('data-course-score', String(item.courseInfo.courseScore || 0));
                       const rate = String(item.currentStepRate || card.textContent || '');
                       const isDone = rate.indexOf('100') > -1 || rate.indexOf('已完成') > -1;
                       card.setAttribute('data-course-done', isDone ? '1' : '0');
@@ -1304,6 +1305,9 @@
   function VirtualCourseWorker(courseInfo, callbacks) {
     const courseId = String(courseInfo.courseId || courseInfo.id || '');
     const courseTitle = courseInfo.title || courseInfo.courseName || '未命名课程';
+    const courseScore = Number(courseInfo.score || courseInfo.courseScore || 0);
+    let sourceId = courseInfo.sourceId || '';
+    let providerCorpCode = courseInfo.providerCorpCode || '';
     let state = 'INIT'; // INIT, RUNNING, FINISHED, ERROR, DESTROYED
     let currentSection = null;
     let sectionIndex = 0;
@@ -1332,8 +1336,34 @@
         state = 'INIT';
         notifyStatus();
 
+        // 0. 官方 LMS 学分系统强绑定与会话入课握手（解决纯后台刷完不计学分的核心杀手锏！）
+        const currentStageId = courseInfo.stageId || sessionStorage.getItem('tb21_current_stage_id') || '';
+        try {
+          // A. 阶段 SCO 对象初始化绑定 (NMS 官方核心学分注册点)
+          if (currentStageId) {
+            await TbApiClient.post('/nms/html/courseStudy/checkUserScoInitComplete.do', {
+              courseId: courseId,
+              currentStageId: currentStageId
+            });
+          }
+          // B. 官方在线播放地址核验
+          await TbApiClient.post('/els/html/courseInfo/courseinfo.checkOlineUrlHttp.do?courseId=' + courseId).catch(function () {});
+          // C. ELS 官方正式入课注册 (进入在学状态，建立用户学习进度档案)
+          await TbApiClient.get('/els/html/studyCourse/studyCourse.enterCourse.do?courseId=' + courseId + '&studyType=STUDY&courseType=NEW_COURSE_CENTER').catch(function () {});
+          // D. 学习项容器握手
+          await TbApiClient.get('/els/html/courseStudyItem/courseStudyItem.learn.do?courseId=' + courseId + '&courseType=NEW_COURSE_CENTER').catch(function () {});
+          // E. 拉取官方 RMS 课程关联配置 (获取精确 sourceId 与 providerCorpCode)
+          const cInfoRes = await TbApiClient.get('/els/html/course/course.courseInfoJsonForRms.do?courseId=' + courseId).catch(function () {});
+          if (cInfoRes && typeof cInfoRes === 'object') {
+            if (cInfoRes.sourceId) sourceId = String(cInfoRes.sourceId);
+            if (cInfoRes.providerCorpCode) providerCorpCode = String(cInfoRes.providerCorpCode);
+          }
+        } catch (e) {
+          console.warn('[刷课助手-静默舰队] 官方入课学分握手容错跳过:', e);
+        }
+
         // 1. 获取小节列表
-        let chapData = await TbApiClient.post('/tbc-rms/course/showCourseChapter', { courseId: courseId });
+        let chapData = await TbApiClient.post('/tbc-rms/course/showCourseChapter', { courseId: courseId, sourceId: sourceId, providerCorpCode: providerCorpCode });
         if (!chapData || !chapData.bizResult || !Array.isArray(chapData.bizResult)) {
           chapData = await TbApiClient.get('/tbc-rms/course/showCourseChapter', { courseId: courseId });
         }
@@ -1350,8 +1380,8 @@
         try {
           const recData = await TbApiClient.post('/tbc-rms/record/getStudyRecordList', {
             courseId: courseId,
-            sourceId: courseInfo.sourceId || '',
-            providerCorpCode: courseInfo.providerCorpCode || ''
+            sourceId: sourceId,
+            providerCorpCode: providerCorpCode
           });
           if (recData && recData.bizResult && Array.isArray(recData.bizResult)) {
             recData.bizResult.forEach(function (r) {
@@ -1399,15 +1429,50 @@
           await runSection(currentSection);
         }
 
-        // 5. 完结整门课
+        // 5. 完结整门课：双重封顶上报 + 官方学分结算握手（确保平台 100% 结算学分！）
         state = 'FINISHED';
         try {
+          const lastSec = pendingList[pendingList.length - 1];
+          if (lastSec) {
+            // 写入关课归档记录 (writeRecordWhileClose)
+            await TbApiClient.post('/tbc-rms/record/writeRecordWhileClose', {
+              recordId: lastSec.recordId,
+              courseId: courseId,
+              sourceId: sourceId,
+              providerCorpCode: providerCorpCode,
+              chapterId: lastSec.chapterId,
+              resourceId: lastSec.resourceId,
+              timeToFinish: lastSec.timeToFinish,
+              currentPosition: lastSec.timeToFinish,
+              type: lastSec.resourceType,
+              currentStudyTime: lastSec.timeToFinish,
+              pageIndex: 0
+            }).catch(function () {});
+          }
+
+          // 官方全局进度同步
           await TbApiClient.post('/tbc-rms/record/syncStudyRecord', {
             courseId: courseId,
-            sourceId: courseInfo.sourceId || '',
-            providerCorpCode: courseInfo.providerCorpCode || ''
-          });
-        } catch (e) {}
+            sourceId: sourceId,
+            providerCorpCode: providerCorpCode
+          }).catch(function () {});
+
+          // 退出课程上报日志
+          await TbApiClient.post('/biz-oim/course/saveStudyLog.do?courseId=' + courseId, {
+            studyLogVO: {
+              courseId: courseId,
+              courseTitle: courseTitle
+            },
+            eventType: 'QUIT_STUDY'
+          }).catch(function () {});
+
+          // ELS 课件注销与学分核算入库握手
+          await TbApiClient.get('/els/html/courseStudyItem/courseStudyItem.logOut.do').catch(function () {});
+          await TbApiClient.get('/els/html/studyCourse/studyCourse.enterCourse.do?courseId=' + courseId + '&studyType=STUDY&courseType=NEW_COURSE_CENTER').catch(function () {});
+        } catch (e) {
+          console.warn('[刷课助手-静默舰队] 完结结课上报容错:', e);
+        }
+
         notifyStatus();
         if (callbacks && callbacks.onComplete) callbacks.onComplete(courseId, courseTitle);
       } catch (err) {
@@ -1437,6 +1502,8 @@
               await TbApiClient.post('/tbc-rms/record/updateCourseRecord', {
                 recordId: sec.recordId,
                 courseId: courseId,
+                sourceId: sourceId,
+                providerCorpCode: providerCorpCode,
                 chapterId: sec.chapterId,
                 resourceId: sec.resourceId,
                 timeToFinish: 1,
@@ -1513,6 +1580,8 @@
             TbApiClient.post('/tbc-rms/record/updateCourseRecord', {
               recordId: sec.recordId,
               courseId: courseId,
+              sourceId: sourceId,
+              providerCorpCode: providerCorpCode,
               chapterId: sec.chapterId,
               resourceId: sec.resourceId,
               timeToFinish: dur,
@@ -1540,6 +1609,8 @@
               await TbApiClient.post('/tbc-rms/record/updateCourseRecord', {
                 recordId: sec.recordId,
                 courseId: courseId,
+                sourceId: sourceId,
+                providerCorpCode: providerCorpCode,
                 chapterId: sec.chapterId,
                 resourceId: sec.resourceId,
                 timeToFinish: dur,
@@ -1550,8 +1621,8 @@
               });
               await TbApiClient.post('/tbc-rms/record/syncStudyRecord', {
                 courseId: courseId,
-                sourceId: courseInfo.sourceId || '',
-                providerCorpCode: courseInfo.providerCorpCode || ''
+                sourceId: sourceId,
+                providerCorpCode: providerCorpCode
               });
             } catch (e) {}
             resolve();
@@ -1575,6 +1646,7 @@
       return {
         courseId: courseId,
         courseTitle: courseTitle,
+        score: courseScore,
         sectionIndex: sectionIndex,
         totalSections: totalSections,
         sectionName: currentSection ? currentSection.resourceName : '',
@@ -1590,6 +1662,49 @@
       destroy: destroy,
       getStatus: getStatus
     };
+  }
+
+
+  // 核心突破：穿透触发 Vue 课程详情页原生重新请求，实时入账学分并刷新课程状态
+  function refreshDetailVueComponent() {
+    try {
+      const appEl = document.querySelector('#app') || document.body;
+      function findDetailVm(node) {
+        if (!node) return null;
+        const v = node.__vue__ || node;
+        if (v && (typeof v.getRmStageByProjectId === 'function' || typeof v.getMustCourseDetailByProjectId === 'function')) {
+          return v;
+        }
+        if (v && Array.isArray(v.$children)) {
+          for (let i = 0; i < v.$children.length; i++) {
+            const found = findDetailVm(v.$children[i]);
+            if (found) return found;
+          }
+        }
+        if (node.children && node.children.length) {
+          for (let j = 0; j < node.children.length; j++) {
+            const found = findDetailVm(node.children[j]);
+            if (found) return found;
+          }
+        }
+        return null;
+      }
+      const targetVm = findDetailVm(appEl);
+      if (targetVm) {
+        const roadMapId = targetVm.roadMapId || sessionStorage.getItem('tb21_current_roadmap_id');
+        const currentStageId = targetVm.currentStageId || sessionStorage.getItem('tb21_current_stage_id');
+        if (roadMapId && typeof targetVm.getRmStageByProjectId === 'function') {
+          targetVm.getRmStageByProjectId(roadMapId);
+        }
+        if (currentStageId) {
+          if (typeof targetVm.getMustCourseDetailByProjectId === 'function') targetVm.getMustCourseDetailByProjectId(currentStageId);
+          if (typeof targetVm.getSelectiveCourseDetailByProjectId === 'function') targetVm.getSelectiveCourseDetailByProjectId(currentStageId);
+        }
+        console.log('[刷课助手] 🔄 成功唤醒 Vue 详情页原生刷新接口，已修学分已实时入账！');
+      }
+    } catch (e) {
+      console.warn('[刷课助手] 唤醒 Vue 详情页跳过:', e);
+    }
   }
 
   /* ---------- 🚀 纯后台无头静默舰队调度中心 (HeadlessFleetManager) ---------- */
@@ -1651,11 +1766,12 @@
           onStatusChange: function () { notify(); },
           onComplete: function (cid, title) {
             completedCourses.push(String(cid));
-            console.log('[刷课助手-静默舰队] 🏆 课程已在纯后台完播结课: ' + title);
+            console.log('[刷课助手-静默舰队] 🏆 课程已在纯后台完播结课并核算学分: ' + title);
             try {
-              const cards = document.querySelectorAll('.text-item.cursor');
+              const cards = document.querySelectorAll('.text-item.cursor, .course-item, .box-card');
               cards.forEach(function (c) {
                 if (getCardCourseId(c) === cid) {
+                  c.setAttribute('data-course-done', '1');
                   const info = c.querySelector('.text-info');
                   if (info && info.textContent.indexOf('已完成') === -1) {
                     info.textContent = info.textContent + ' (已完成)';
@@ -1663,6 +1779,16 @@
                 }
               });
             } catch (e) {}
+
+            // 核心突破：穿透触发 Vue 课程详情页刷新，并即刻刷新悬浮面板学分进度
+            refreshDetailVueComponent();
+            try {
+              const panel = cachedEl('tb21-auto-panel');
+              if (panel && typeof updateAutoPanel === 'function') {
+                updateAutoPanel(panel, panel.__tb21ExtraInfo);
+              }
+            } catch (e) {}
+
             workers = workers.filter(function (w) { return w !== worker; });
             dispatch();
             notify();
@@ -1837,6 +1963,7 @@
                 fleetCourses.push({
                   courseId: String(c.courseId),
                   title: c.title || ('课程_' + c.courseId),
+                  score: Number(c.score || c.courseScore || 0),
                   sourceId: '',
                   providerCorpCode: ''
                 });
@@ -1856,10 +1983,12 @@
           if (!cid) return;
           const titleEl = c.querySelector('.text-title, .title, .course-name, h4, h3, .item__name');
           const title = c.getAttribute('data-course-title') || (titleEl ? titleEl.textContent.trim() : ('课程_' + cid));
+          const scoreVal = parseFloat(c.getAttribute('data-course-score') || getCourseCredits(c)) || 0;
           if (!fleetCourses.some(function (x) { return x.courseId === cid; })) {
             fleetCourses.push({
               courseId: cid,
               title: title,
+              score: scoreVal,
               sourceId: '',
               providerCorpCode: ''
             });
@@ -2066,6 +2195,11 @@
         if (timeEl && timeEl.textContent !== '⏱️ ' + w.remainText) {
           timeEl.textContent = '⏱️ ' + w.remainText;
         }
+        const scoreEl = card.querySelector('.ap-fleet-score');
+        const scoreText = w.score ? (w.score + ' 学分') : '';
+        if (scoreEl && scoreEl.textContent !== scoreText) {
+          scoreEl.textContent = scoreText;
+        }
         const secEl = card.querySelector('.ap-fleet-sec-info');
         const secText = (w.totalSections > 0 ? ('第' + w.sectionIndex + '/' + w.totalSections + '节: ' + w.sectionName) : '准备中');
         if (secEl && secEl.textContent !== secText) {
@@ -2089,7 +2223,10 @@
           '<div class="ap-fleet-card" data-cid="' + w.courseId + '">' +
             '<div class="ap-fleet-card-title">' +
               '<span class="ap-fleet-cname" title="' + w.courseTitle + '">' + w.courseTitle + '</span>' +
-              '<span class="ap-fleet-time">⏱️ ' + w.remainText + '</span>' +
+              '<div style="display:flex;align-items:center;gap:4px;flex-shrink:0;">' +
+                (w.score ? ('<span class="ap-fleet-score" style="background:rgba(245,158,11,.15);color:#fbbf24;border:1px solid rgba(245,158,11,.3);padding:1px 5px;border-radius:4px;font-size:10px;font-weight:700;">' + w.score + ' 学分</span>') : '') +
+                '<span class="ap-fleet-time">⏱️ ' + w.remainText + '</span>' +
+              '</div>' +
             '</div>' +
             '<div class="ap-fleet-card-sub">' +
               '<span class="ap-fleet-sec-info">' + (w.totalSections > 0 ? ('第' + w.sectionIndex + '/' + w.totalSections + '节: ' + w.sectionName) : '准备中') + '</span>' +
