@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.15.13
+// @version      1.15.14
 // @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量/官方LMS学分全闭环结算)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://testingcf.jsdelivr.net/gh/Arturia169/cq-21tb-shuake@main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -2645,18 +2645,22 @@
     }
     const infoEl = panel.querySelector('.ap-info');
     if (infoEl && extraInfo) {
-      const content = typeof extraInfo === 'function' ? extraInfo() : extraInfo;
-      if (typeof content === 'string' && content.indexOf('<') > -1) {
-        if (infoEl._lastHtml !== content) {
-          infoEl._lastHtml = content;
-          infoEl.innerHTML = content;
+      try {
+        const content = typeof extraInfo === 'function' ? extraInfo() : extraInfo;
+        if (typeof content === 'string' && content.indexOf('<') > -1) {
+          if (infoEl._lastHtml !== content) {
+            infoEl._lastHtml = content;
+            infoEl.innerHTML = content;
+          }
+        } else {
+          if (infoEl.textContent !== content) {
+            infoEl._lastHtml = null;
+            infoEl.className = 'ap-info ap-text-info';
+            infoEl.textContent = content;
+          }
         }
-      } else {
-        if (infoEl.textContent !== content) {
-          infoEl._lastHtml = null;
-          infoEl.className = 'ap-info ap-text-info';
-          infoEl.textContent = content;
-        }
+      } catch (err) {
+        console.error('[刷课助手] updateAutoPanel 渲染异常:', err);
       }
     }
   }
@@ -3250,6 +3254,10 @@
    * ================================================================ */
   function initCourseDetail() {
     setDetailUrl(location.href); // 记录当前详情页 URL，课程刷完后返回这里
+    const activeCategory = getActiveCategory();
+    const categoryScope = activeCategory && activeCategory.key
+      ? activeCategory.key
+      : 'detail:' + normalizeAutoText(location.pathname + location.search + location.hash);
     if (isAutoRunning()) {
       TbApiClient.startSessionHeartbeat();
     }
@@ -3818,10 +3826,6 @@
     let clickLock = 0; // 导航锁：点击课程后一段时间内不再操作，防止反复点击导致闪黑
     let exhaustedTabs = {}; // 当前巡课周期内已经逐页确认无可学课程的 tab
 
-    const activeCategory = getActiveCategory();
-    const categoryScope = activeCategory && activeCategory.key
-      ? activeCategory.key
-      : 'detail:' + normalizeAutoText(location.pathname + location.search + location.hash);
     function getCourseCardKey(card, title, tabName) {
       const cid = getCardCourseId(card);
       if (cid) return 'course-id:' + cid;
