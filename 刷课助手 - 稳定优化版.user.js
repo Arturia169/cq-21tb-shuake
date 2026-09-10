@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.15.15
+// @version      1.15.16
 // @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量/官方LMS学分全闭环结算)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://testingcf.jsdelivr.net/gh/Arturia169/cq-21tb-shuake@main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -1374,17 +1374,7 @@
           const sid = typeof sessionSid === 'function' ? sessionSid() : '';
           const sidQuery = sid ? ('&eln_session_id=' + encodeURIComponent(sid)) : '';
 
-          // A. 阶段 SCO 对象初始化绑定 (NMS 官方核心学分注册点)
-          if (currentStageId) {
-            const scoUrl = '/nms/html/courseStudy/checkUserScoInitComplete.do?courseId=' + courseId + '&currentStageId=' + currentStageId + '&stageId=' + currentStageId;
-            await TbApiClient.postForm(scoUrl, {
-              courseId: courseId,
-              currentStageId: currentStageId,
-              stageId: currentStageId
-            }).catch(function () {});
-            await TbApiClient.get(scoUrl).catch(function () {});
-          }
-          // B. 官方在线播放地址核验
+          // A. 官方在线播放地址核验
           await TbApiClient.post('/els/html/courseInfo/courseinfo.checkOlineUrlHttp.do?courseId=' + courseId).catch(function () {});
           // C. ELS 官方正式入课注册 (进入在学状态，建立用户学习进度档案，带上 eln_session_id)
           await TbApiClient.get('/els/html/studyCourse/studyCourse.enterCourse.do?courseId=' + courseId + '&studyType=STUDY&courseType=NEW_COURSE_CENTER' + sidQuery).catch(function () {});
@@ -1554,16 +1544,8 @@
           await TbApiClient.get('/els/html/studyCourse/studyCourse.finishCourse.do?' + finishQs).catch(function () {});
           await TbApiClient.get('/els/html/courseStudyItem/courseStudyItem.logOut.do?' + finishQs).catch(function () {});
 
-          // NMS 阶段 SCO 终审核验与学分入账结算 (解决学分不计入培训项目的终极关键！)
+          // NMS 阶段学分汇总与状态同步
           if (currentStageId) {
-            const scoUrl = '/nms/html/courseStudy/checkUserScoInitComplete.do?' + finishQs;
-            await TbApiClient.postForm(scoUrl, {
-              courseId: courseId,
-              currentStageId: currentStageId,
-              stageId: currentStageId
-            }).catch(function () {});
-            await TbApiClient.get(scoUrl).catch(function () {});
-
             // 触发 NMS 重新拉取该阶段完成课程，强制触发服务端学分汇总累加
             await TbApiClient.get('/nms/html/courseStudy/getCourseDetailByProjectId.do', {
               stageId: currentStageId,
