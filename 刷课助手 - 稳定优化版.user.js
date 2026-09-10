@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.15.12
+// @version      1.15.13
 // @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量/官方LMS学分全闭环结算)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://testingcf.jsdelivr.net/gh/Arturia169/cq-21tb-shuake@main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -83,7 +83,7 @@
 
                   // 对应 DOM 卡片逐一打桩
                   const curList = (vm.activeName === 'SELECTIVE' ? ele : must);
-                  const cards = document.querySelectorAll('.text-item.cursor');
+                  const cards = document.querySelectorAll('.text-item.cursor, .text-item, .course-item, .box-card, .course-card');
                   cards.forEach(function(card, idx) {
                     const item = curList[idx];
                     if (item && item.courseInfo && item.courseInfo.courseId) {
@@ -3296,21 +3296,26 @@
 
     /* ---------- 课程统计（分必修/选修，已完成/未完成/总数，只统计可见卡片） ---------- */
     function getVisibleCards() {
-      return Array.prototype.slice.call(document.querySelectorAll('.text-item.cursor')).filter(function (c) {
+      const candidates = document.querySelectorAll(
+        '.text-item.cursor, .text-item, .course-item, .box-card, .course-card, .el-card'
+      );
+      return Array.prototype.slice.call(candidates).filter(function (c) {
+        if (c.closest('.course-pipeline-box, .ap-fleet-box, .year-category-container')) return false;
         return c.offsetParent !== null && getComputedStyle(c).display !== 'none';
       });
     }
     function countCourses() {
       const result = { required: { total: 0, done: 0, unfinished: 0 }, elective: { total: 0, done: 0, unfinished: 0 } };
+      const activeTab = document.querySelector('.el-tabs__item.is-active');
+      const activeTabTxt = activeTab ? activeTab.textContent : '';
       getVisibleCards().forEach(function (c) {
-        const info = c.querySelector('.text-info');
-        if (!info) return;
+        const info = c.querySelector('.text-info, .course-info, .info, .text-desc') || c;
+        const txt = (info ? info.textContent : '') || c.textContent || '';
         const courseId = getCardCourseId(c);
-        const txt = info.textContent;
         const isDone = txt.indexOf('已完成') > -1 ||
                        c.getAttribute('data-course-done') === '1' ||
                        (typeof HeadlessFleetManager !== 'undefined' && HeadlessFleetManager.isCompleted(courseId));
-        const isRequired = txt.indexOf('必修') > -1;
+        const isRequired = txt.indexOf('必修') > -1 || activeTabTxt.indexOf('必修') > -1;
         const tab = isRequired ? 'required' : 'elective';
         result[tab].total++;
         if (isDone) result[tab].done++;
@@ -3585,15 +3590,17 @@
 
       const reqCards = [];
       const eleCards = [];
+      const activeTab = document.querySelector('.el-tabs__item.is-active');
+      const activeTabTxt = activeTab ? activeTab.textContent : '';
+
       allCards.forEach(function (c, idx) {
-        const info = c.querySelector('.text-info');
-        if (!info) return;
+        const info = c.querySelector('.text-info, .course-info, .info, .text-desc') || c;
         const cid = getCardCourseId(c);
-        const txt = info.textContent;
+        const txt = (info ? info.textContent : '') || c.textContent || '';
         const isDone = txt.indexOf('已完成') > -1 ||
                        c.getAttribute('data-course-done') === '1' ||
                        (typeof HeadlessFleetManager !== 'undefined' && HeadlessFleetManager.isCompleted(cid));
-        const isRequired = txt.indexOf('必修') > -1;
+        const isRequired = txt.indexOf('必修') > -1 || (activeTabTxt.indexOf('必修') > -1 && txt.indexOf('选修') === -1);
         const credits = getCourseCredits(c);
         const title = getCourseTitle(c);
         const courseId = cid;
@@ -3926,16 +3933,18 @@
       const planItems = plan.planReq.concat(plan.planEle).filter(function (i) { return !i.done; });
       const skipItems = plan.skipReq.concat(plan.skipEle).filter(function (i) { return !i.done; });
       const doneItems = [];
+      const activeTab = document.querySelector('.el-tabs__item.is-active');
+      const activeTabTxt = activeTab ? activeTab.textContent : '';
       cards.forEach(function (c, idx) {
-        const info = c.querySelector('.text-info');
-        if (!info) return;
+        const info = c.querySelector('.text-info, .course-info, .info, .text-desc') || c;
+        const txt = (info ? info.textContent : '') || c.textContent || '';
         const cid = getCardCourseId(c);
         if (txt.indexOf('已完成') > -1 || c.getAttribute('data-course-done') === '1' || (typeof HeadlessFleetManager !== 'undefined' && HeadlessFleetManager.isCompleted(cid))) {
           doneItems.push({
             card: c,
             title: getCourseTitle(c),
             credits: getCourseCredits(c),
-            isRequired: txt.indexOf('必修') > -1,
+            isRequired: txt.indexOf('必修') > -1 || (activeTabTxt.indexOf('必修') > -1 && txt.indexOf('选修') === -1),
             done: true,
             idx: idx
           });
