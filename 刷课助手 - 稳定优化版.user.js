@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.15.8
-// @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
+// @version      1.15.11
+// @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量/官方LMS学分全闭环结算)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://testingcf.jsdelivr.net/gh/Arturia169/cq-21tb-shuake@main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
 // @downloadURL  https://testingcf.jsdelivr.net/gh/Arturia169/cq-21tb-shuake@main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -911,7 +911,7 @@
 
   /* ============ 官方后端 API 深度集成服务 (TbApiClient) ============ */
   const TbApiClient = (function () {
-    const BASE = 'https://cqrl.21tb.com';
+    const BASE = (typeof location !== 'undefined' && location.origin) ? location.origin : 'https://cqrl.21tb.com';
     let _heartbeatTimer = null;
 
     async function request(url, options) {
@@ -938,6 +938,15 @@
         if (options.data) {
           if (typeof options.data === 'string') {
             fetchOpts.body = options.data;
+          } else if (options.isForm) {
+            fetchOpts.headers['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8';
+            const params = new URLSearchParams();
+            Object.keys(options.data).forEach(function (k) {
+              if (options.data[k] !== undefined && options.data[k] !== null) {
+                params.append(k, String(options.data[k]));
+              }
+            });
+            fetchOpts.body = params.toString();
           } else {
             fetchOpts.headers['Content-Type'] = 'application/json;charset=UTF-8';
             fetchOpts.body = JSON.stringify(options.data);
@@ -979,6 +988,14 @@
     function post(url, data, options) {
       options = options || {};
       options.method = 'POST';
+      options.data = data;
+      return request(url, options);
+    }
+
+    function postForm(url, data, options) {
+      options = options || {};
+      options.method = 'POST';
+      options.isForm = true;
       options.data = data;
       return request(url, options);
     }
@@ -1047,6 +1064,7 @@
         for (let i = 0; i < (stages.length || 1); i++) {
           const sId = stages[i] ? stages[i].stageId : '';
           if (!sId) continue;
+          try { sessionStorage.setItem('tb21_current_stage_id', String(sId)); } catch (e) {}
           const [mustRes, eleRes] = await Promise.all([
             get('/nms/html/courseStudy/getCourseDetailByProjectId.do', {
               stageId: sId,
@@ -1073,6 +1091,7 @@
                   courseId: cid,
                   title: row.courseInfo.courseTitle || ('课程_' + cid),
                   score: row.courseInfo.courseScore || 0,
+                  stageId: String(sId),
                   sourceId: '',
                   providerCorpCode: ''
                 });
@@ -1095,6 +1114,7 @@
                   courseId: cid,
                   title: r.courseName || r.courseTitle || (r.courseInfo && r.courseInfo.courseTitle) || ('课程_' + cid),
                   score: r.score || r.courseScore || 0,
+                  stageId: sessionStorage.getItem('tb21_current_stage_id') || '',
                   sourceId: '',
                   providerCorpCode: ''
                 });
@@ -1336,34 +1356,56 @@
         state = 'INIT';
         notifyStatus();
 
-        // 0. 官方 LMS 学分系统强绑定与会话入课握手（解决纯后台刷完不计学分的核心杀手锏！）
-        const currentStageId = courseInfo.stageId || sessionStorage.getItem('tb21_current_stage_id') || '';
+        // 0. 官方 LMS 学分系统强绑定与阶段 SCO 初始化（解决纯后台刷完不计学分的核心杀手锏！）
+        let currentStageId = courseInfo.stageId || sessionStorage.getItem('tb21_current_stage_id') || '';
+        if (!currentStageId) {
+          try {
+            const q = getRouteQueryParams();
+            currentStageId = q.stageId || '';
+          } catch (e) {}
+        }
+        if (currentStageId) {
+          courseInfo.stageId = currentStageId;
+          try { sessionStorage.setItem('tb21_current_stage_id', String(currentStageId)); } catch (e) {}
+        }
+
         try {
+          const sid = typeof sessionSid === 'function' ? sessionSid() : '';
+          const sidQuery = sid ? ('&eln_session_id=' + encodeURIComponent(sid)) : '';
+
           // A. 阶段 SCO 对象初始化绑定 (NMS 官方核心学分注册点)
           if (currentStageId) {
-            await TbApiClient.post('/nms/html/courseStudy/checkUserScoInitComplete.do', {
+            const scoUrl = '/nms/html/courseStudy/checkUserScoInitComplete.do?courseId=' + courseId + '&currentStageId=' + currentStageId + '&stageId=' + currentStageId;
+            await TbApiClient.postForm(scoUrl, {
               courseId: courseId,
-              currentStageId: currentStageId
-            });
+              currentStageId: currentStageId,
+              stageId: currentStageId
+            }).catch(function () {});
+            await TbApiClient.get(scoUrl).catch(function () {});
           }
           // B. 官方在线播放地址核验
           await TbApiClient.post('/els/html/courseInfo/courseinfo.checkOlineUrlHttp.do?courseId=' + courseId).catch(function () {});
-          // C. ELS 官方正式入课注册 (进入在学状态，建立用户学习进度档案)
-          await TbApiClient.get('/els/html/studyCourse/studyCourse.enterCourse.do?courseId=' + courseId + '&studyType=STUDY&courseType=NEW_COURSE_CENTER').catch(function () {});
+          // C. ELS 官方正式入课注册 (进入在学状态，建立用户学习进度档案，带上 eln_session_id)
+          await TbApiClient.get('/els/html/studyCourse/studyCourse.enterCourse.do?courseId=' + courseId + '&studyType=STUDY&courseType=NEW_COURSE_CENTER' + sidQuery).catch(function () {});
           // D. 学习项容器握手
-          await TbApiClient.get('/els/html/courseStudyItem/courseStudyItem.learn.do?courseId=' + courseId + '&courseType=NEW_COURSE_CENTER').catch(function () {});
+          await TbApiClient.get('/els/html/courseStudyItem/courseStudyItem.learn.do?courseId=' + courseId + '&courseType=NEW_COURSE_CENTER&vb_server=' + encodeURIComponent('http://21tb-video.21tb.com') + sidQuery).catch(function () {});
           // E. 拉取官方 RMS 课程关联配置 (获取精确 sourceId 与 providerCorpCode)
           const cInfoRes = await TbApiClient.get('/els/html/course/course.courseInfoJsonForRms.do?courseId=' + courseId).catch(function () {});
           if (cInfoRes && typeof cInfoRes === 'object') {
-            if (cInfoRes.sourceId) sourceId = String(cInfoRes.sourceId);
-            if (cInfoRes.providerCorpCode) providerCorpCode = String(cInfoRes.providerCorpCode);
+            const sId = cInfoRes.sourceId || (cInfoRes.course && cInfoRes.course.sourceId) || (cInfoRes.bizResult && cInfoRes.bizResult.sourceId) || (cInfoRes.data && cInfoRes.data.sourceId) || '';
+            const pCorp = cInfoRes.providerCorpCode || (cInfoRes.course && cInfoRes.course.providerCorpCode) || (cInfoRes.bizResult && cInfoRes.bizResult.providerCorpCode) || (cInfoRes.data && cInfoRes.data.providerCorpCode) || '';
+            if (sId) sourceId = String(sId);
+            if (pCorp) providerCorpCode = String(pCorp);
           }
         } catch (e) {
           console.warn('[刷课助手-静默舰队] 官方入课学分握手容错跳过:', e);
         }
 
-        // 1. 获取小节列表
+        // 1. 获取小节列表（三级网络容错）
         let chapData = await TbApiClient.post('/tbc-rms/course/showCourseChapter', { courseId: courseId, sourceId: sourceId, providerCorpCode: providerCorpCode });
+        if (!chapData || !chapData.bizResult || !Array.isArray(chapData.bizResult)) {
+          chapData = await TbApiClient.postForm('/tbc-rms/course/showCourseChapter', { courseId: courseId, sourceId: sourceId, providerCorpCode: providerCorpCode });
+        }
         if (!chapData || !chapData.bizResult || !Array.isArray(chapData.bizResult)) {
           chapData = await TbApiClient.get('/tbc-rms/course/showCourseChapter', { courseId: courseId });
         }
@@ -1449,7 +1491,7 @@
         // 5. 完结整门课：双重封顶上报 + 官方学分结算握手（确保平台 100% 结算学分！）
         state = 'FINISHED';
         try {
-          const lastSec = pendingList[pendingList.length - 1];
+          const lastSec = (pendingList && pendingList.length > 0) ? pendingList[pendingList.length - 1] : null;
           if (lastSec) {
             // 写入关课归档记录 (writeRecordWhileClose)
             await TbApiClient.post('/tbc-rms/record/writeRecordWhileClose', {
@@ -1461,8 +1503,8 @@
               resourceId: lastSec.resourceId,
               timeToFinish: lastSec.timeToFinish,
               currentPosition: lastSec.timeToFinish,
-              type: lastSec.resourceType,
-              currentStudyTime: lastSec.timeToFinish,
+              type: lastSec.resourceType || 'video',
+              currentStudyTime: Math.max(Math.round(lastSec.timeToFinish * 0.6), lastSec.timeToFinish),
               pageIndex: 0
             }).catch(function () {});
           }
@@ -1474,20 +1516,64 @@
             providerCorpCode: providerCorpCode
           }).catch(function () {});
 
-          // 退出课程上报日志
+          const sid = typeof sessionSid === 'function' ? sessionSid() : '';
+          const sidQuery = sid ? ('&eln_session_id=' + encodeURIComponent(sid)) : '';
+          const finishQs = 'courseId=' + courseId + (currentStageId ? ('&currentStageId=' + currentStageId + '&stageId=' + currentStageId) : '') + sidQuery;
+
+          // ELS 官方整门课 100% 完课上报 (核心学分触发点！)
+          await TbApiClient.postForm('/els/html/courseStudyItem/courseStudyItem.saveCoursePrecent.do?courseId=' + courseId, {
+            courseId: courseId,
+            progress_measure: 100,
+            rate: 100
+          }).catch(function () {});
+          await TbApiClient.get('/els/html/courseStudyItem/courseStudyItem.saveCoursePrecent.do?courseId=' + courseId + '&progress_measure=100&rate=100' + sidQuery).catch(function () {});
+
+          // 结课日志上报 (COMPLETE_COURSE 与 QUIT_STUDY)
           await TbApiClient.post('/biz-oim/course/saveStudyLog.do?courseId=' + courseId, {
             studyLogVO: {
               courseId: courseId,
-              courseTitle: courseTitle
+              courseTitle: courseTitle,
+              studyTime: 30,
+              minStudyTime: 0
+            },
+            eventType: 'COMPLETE_COURSE'
+          }).catch(function () {});
+          await TbApiClient.post('/biz-oim/course/saveStudyLog.do?courseId=' + courseId, {
+            studyLogVO: {
+              courseId: courseId,
+              courseTitle: courseTitle,
+              studyTime: 30,
+              minStudyTime: 0
             },
             eventType: 'QUIT_STUDY'
           }).catch(function () {});
 
-          // ELS 课件注销与学分核算入库握手
-          await TbApiClient.get('/els/html/courseStudyItem/courseStudyItem.logOut.do').catch(function () {});
-          await TbApiClient.get('/els/html/studyCourse/studyCourse.enterCourse.do?courseId=' + courseId + '&studyType=STUDY&courseType=NEW_COURSE_CENTER').catch(function () {});
+          // ELS 课件正式结课与注销握手 (finishCourse.do & logOut.do)
+          await TbApiClient.get('/els/html/courseStudyItem/courseStudyItem.finishCourse.do?' + finishQs).catch(function () {});
+          await TbApiClient.get('/els/html/studyCourse/studyCourse.finishCourse.do?' + finishQs).catch(function () {});
+          await TbApiClient.get('/els/html/courseStudyItem/courseStudyItem.logOut.do?' + finishQs).catch(function () {});
+
+          // NMS 阶段 SCO 终审核验与学分入账结算 (解决学分不计入培训项目的终极关键！)
+          if (currentStageId) {
+            const scoUrl = '/nms/html/courseStudy/checkUserScoInitComplete.do?' + finishQs;
+            await TbApiClient.postForm(scoUrl, {
+              courseId: courseId,
+              currentStageId: currentStageId,
+              stageId: currentStageId
+            }).catch(function () {});
+            await TbApiClient.get(scoUrl).catch(function () {});
+
+            // 触发 NMS 重新拉取该阶段完成课程，强制触发服务端学分汇总累加
+            await TbApiClient.get('/nms/html/courseStudy/getCourseDetailByProjectId.do', {
+              stageId: currentStageId,
+              courseStatus: 'COMPLETE',
+              pageNo: 1,
+              pageSize: 10
+            }).catch(function () {});
+          }
+          console.log('[刷课助手-静默舰队] 🏆 官方全链路结课与学分结算握手已全部完成: ' + courseTitle);
         } catch (e) {
-          console.warn('[刷课助手-静默舰队] 完结结课上报容错:', e);
+          console.warn('[刷课助手-静默舰队] 完结结课官方学分结算容错:', e);
         }
 
         notifyStatus();
@@ -1999,6 +2085,7 @@
 
     if (isDetail) {
       let fleetCourses = [];
+      const defaultStageId = sessionStorage.getItem('tb21_current_stage_id') || (getRouteQueryParams().stageId || '');
 
       // 策略 A: 从主页面上下文穿透写入的 sessionStorage 提取
       try {
@@ -2012,6 +2099,7 @@
                   courseId: String(c.courseId),
                   title: c.title || ('课程_' + c.courseId),
                   score: Number(c.score || c.courseScore || 0),
+                  stageId: c.stageId || defaultStageId,
                   sourceId: '',
                   providerCorpCode: ''
                 });
@@ -2033,11 +2121,13 @@
           const titleEl = c.querySelector('.text-title, .title, .course-name, h4, h3, .item__name');
           const title = c.getAttribute('data-course-title') || (titleEl ? titleEl.textContent.trim() : ('课程_' + cid));
           const scoreVal = parseFloat(c.getAttribute('data-course-score') || getCourseCredits(c)) || 0;
+          const cardStageId = c.getAttribute('data-course-stage-id') || defaultStageId;
           if (!fleetCourses.some(function (x) { return x.courseId === cid; })) {
             fleetCourses.push({
               courseId: cid,
               title: title,
               score: scoreVal,
+              stageId: cardStageId,
               sourceId: '',
               providerCorpCode: ''
             });
@@ -2049,10 +2139,11 @@
       if (fleetCourses.length === 0) {
         const params = getRouteQueryParams();
         const projectId = params.projectId || '';
-        if (projectId) {
-          console.log('[刷课助手-静默舰队] 📡 正在通过官方接口全量同步当前项目未学课程 (projectId: ' + projectId + ')...');
+        const roadMapId = params.roadMapId || sessionStorage.getItem('tb21_current_roadmap_id') || '';
+        if (projectId || roadMapId) {
+          console.log('[刷课助手-静默舰队] 📡 正在通过官方接口全量同步当前项目未学课程 (projectId: ' + projectId + ', roadMapId: ' + roadMapId + ')...');
           try {
-            const apiCourses = await TbApiClient.fetchDetailCourses(projectId);
+            const apiCourses = await TbApiClient.fetchDetailCourses(projectId, roadMapId);
             if (apiCourses && apiCourses.length > 0) {
               fleetCourses = apiCourses;
               console.log('[刷课助手-静默舰队] 🏆 官方接口成功捕获未学课程共 ' + apiCourses.length + ' 门！');
@@ -3964,6 +4055,7 @@
         const plan = computeOptimalCoursePlan(allCards, credit);
         const plannedCourses = plan.planReq.concat(plan.planEle).filter(function (c) { return !c.done; });
 
+        const defStageId = sessionStorage.getItem('tb21_current_stage_id') || '';
         const fleetCourses = [];
         plannedCourses.forEach(function (c) {
           const cid = getCardCourseId(c.card);
@@ -3971,6 +4063,7 @@
             fleetCourses.push({
               courseId: cid,
               title: c.title,
+              stageId: (c.card && c.card.getAttribute('data-course-stage-id')) || defStageId,
               sourceId: '',
               providerCorpCode: ''
             });
