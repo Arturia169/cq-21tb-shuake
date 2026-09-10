@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         刷课助手
 // @namespace    local.21tb.shuake.helper
-// @version      1.15.11
+// @version      1.15.12
 // @description  在线课程学习辅助（21tb / 重庆公需课）：智能高性价比选课（学分/时长比最高优先/微课最短耗时优先/高分攻坚三模式调度）、倍速播放（2x~16x）、极速冲刺秒刷、纯后台无头静默多课并发舰队(0%CPU/0视频流量/官方LMS学分全闭环结算)、各倍速预计播完时间、自动静音、播完自动下一节、多课同刷、可拖动统一悬浮窗、无人值守自动化（大类目→小科目→课程 自动切换循环）、年度大类目可折叠课程列表、自动关闭异常弹窗、自动处理挂起检测、答题验证提醒、防掉线、性能优化（DOM缓存/倍速事件驱动/降频守护）
 // @author       Ryan
 // @updateURL    https://testingcf.jsdelivr.net/gh/Arturia169/cq-21tb-shuake@main/%E5%88%B7%E8%AF%BE%E5%8A%A9%E6%89%8B%20-%20%E7%A8%B3%E5%AE%9A%E4%BC%98%E5%8C%96%E7%89%88.user.js
@@ -2011,6 +2011,16 @@
     return params;
   }
 
+  function getGlobalNavLock() {
+    try {
+      const t = parseInt(sessionStorage.getItem('tb21_global_nav_lock') || '0', 10);
+      return Date.now() < t;
+    } catch (e) { return false; }
+  }
+  function setGlobalNavLock(ms) {
+    try { sessionStorage.setItem('tb21_global_nav_lock', String(Date.now() + (ms || 8000))); } catch (e) {}
+  }
+
   function normalizeAutoText(value) {
     return String(value || '').replace(/\s+/g, '').replace(/[：:·•|｜]/g, '').toLowerCase();
   }
@@ -2159,10 +2169,15 @@
         console.log('[刷课助手-静默舰队] ℹ️ 当前页面卡片暂未完全载入或已全部学完，保持待命监听');
       }
     } else if (isList) {
-      console.log('[刷课助手-静默舰队] 🎯 列表页触发静默舰队，自动进入目标年度攻坚...');
-      const enterBtns = document.querySelectorAll('.course__item .enter-btn, .box-card .enter-btn');
-      if (enterBtns.length > 0) {
-        enterBtns[0].click();
+      const now = Date.now();
+      if (!window.__tb21_last_fleet_enter || now - window.__tb21_last_fleet_enter > 20000) {
+        window.__tb21_last_fleet_enter = now;
+        console.log('[刷课助手-静默舰队] 🎯 列表页触发静默舰队，自动进入目标年度攻坚...');
+        const enterBtns = document.querySelectorAll('.course__item .enter-btn, .box-card .enter-btn');
+        if (enterBtns.length > 0) {
+          setGlobalNavLock(15000);
+          enterBtns[0].click();
+        }
       }
     }
     renderFleetDashboard();
@@ -3136,7 +3151,7 @@
       if (!isAutoRunning()) return;
       TbApiClient.startSessionHeartbeat();
       if (location.hash.indexOf('course/list') === -1) return; // 路由守卫：只在列表页执行
-      if (Date.now() < clickLock) return; // 导航锁生效中
+      if (Date.now() < clickLock || getGlobalNavLock()) return; // 全局/局部导航锁生效中
       const items = document.querySelectorAll('.course__item');
       if (items.length === 0) return;
 
@@ -3180,6 +3195,7 @@
         console.log('[刷课助手] 🎯 流水线调度锁定大类目：', targetItem.title.trim().slice(0, 40), `(进度:${targetItem.progress}%, 年份:${targetItem.year || '未知'})`);
         rememberActiveCategory(targetItem.it);
         clickLock = Date.now() + 15000; // 锁定 15 秒等待导航进入
+        setGlobalNavLock(15000);
         targetItem.btn.click();
         return;
       }
@@ -3669,6 +3685,20 @@
         }
       };
 
+      if (allCards.length === 0) {
+        return {
+          planReq: [],
+          planEle: [],
+          skipReq: [],
+          skipEle: [],
+          needReqCredit: 999,
+          needEleCredit: 999,
+          accReqCredit: 0,
+          accEleCredit: 0,
+          isFullySatisfied: false
+        };
+      }
+
       reqCards.sort(sortFn);
       eleCards.sort(sortFn);
 
@@ -3716,7 +3746,10 @@
         }
       });
 
-      const isFullySatisfied = needReqCredit <= 0 && needEleCredit <= 0;
+      // 核心安全：当卡片未抓取到或指标未就绪时，绝不误判满足；只有明确指标差额均为0时才为 true
+      const isFullySatisfied = (requirement && requirement.remainingRequired !== null && requirement.remainingElective !== null)
+        ? (needReqCredit <= 0 && needEleCredit <= 0)
+        : false;
 
       return {
         planReq: planReq,
@@ -4073,15 +4106,18 @@
         return; // 不点击任何卡片，防止弹窗打扰！
       }
       if (location.hash.indexOf('courseDetail') === -1) { stage = 0; exhaustedTabs = {}; return; } // 路由守卫
-      if (Date.now() < clickLock) return; // 导航锁生效中
+      if (Date.now() < clickLock || getGlobalNavLock()) return; // 导航锁生效中
 
       const tabs = document.querySelectorAll('.el-tabs__item');
       const activeTab = document.querySelector('.el-tabs__item.is-active');
       const activeName = activeTab ? activeTab.textContent.trim() : '';
 
+      // 核心卡片异步加载守卫：卡片数量为 0 时先等待，绝不能误判通关！
+      const allCards = getVisibleCards();
+      if (allCards.length === 0) return;
+
       // 复用组件使用的学分要求解析结果，保证显示与自动决策一致。
       const requirement = readCategoryRequirement();
-      const allCards = getVisibleCards();
       const plan = computeOptimalCoursePlan(allCards, requirement);
 
       // 1. 核心判定：如果整个大类目的学分要求已经完全满足，顺利通关并返回大类目列表！
@@ -4110,7 +4146,8 @@
           } catch (err) {}
         })();
 
-        clickLock = Date.now() + 5000;
+        clickLock = Date.now() + 8000;
+        setGlobalNavLock(8000);
         stage = 0;
         returnToCategoryList();
         return;
@@ -4151,7 +4188,8 @@
           } catch (err) {}
         })();
 
-        clickLock = Date.now() + 5000;
+        clickLock = Date.now() + 8000;
+        setGlobalNavLock(8000);
         stage = 0;
         returnToCategoryList();
         return;
@@ -4300,7 +4338,8 @@
             ts: Date.now()
           });
           console.log('[刷课助手] 🎯 攻坚锁定高分课程：', target.title, '(' + target.credits + '学分，第' + currentPage + '页)');
-          clickLock = Date.now() + 15000;
+          clickLock = Date.now() + 20000;
+          setGlobalNavLock(20000);
           stage = 0;
           smartClickCourse(target.card);
           return;
